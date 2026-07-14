@@ -1,6 +1,6 @@
 # pytorch_cryoEM
 
-pytorch implementation of many cryo-EM softwares. Right now all softwares come from the Grigorieff Lab.
+pytorch implementation (by ChatGPT 5.5 and 5.6) of many cryo-EM softwares. Right now all softwares come from the Grigorieff Lab.
 
 ## Required libraries
 
