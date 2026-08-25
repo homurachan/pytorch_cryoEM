@@ -6,13 +6,20 @@ pytorch implementation (by ChatGPT 5.5 and 5.6) of many cryo-EM softwares. Right
 
 pytorch, numpy, scipy, mrcfile, tifffile, imagecodecs, matplotlib
 
+For unbend_pytorch_v2, nvidia-nvimgcodec-cu12[nvtiff] is needed.
+
 # Contents
 
-1. The pytorch-implementation of Unbend ([Lingli Kong](https://linglikong.github.io/) et al., https://elifesciences.org/reviewed-preprints/109119)
+1. The pytorch-implementation of Unbend ([Lingli Kong](https://linglikong.github.io/) et al., https://elifesciences.org/reviewed-preprints/109119v2)
 
 2. The pytorch-implementation of [ctffind 4.1.8](https://grigoriefflab.umassmed.edu/ctffind4) and [ctftilt](https://grigoriefflab.umassmed.edu/ctf_estimation_ctffind_ctftilt)
 
 3. The pytorch-implementation of cisTEM-simulate is here: https://github.com/homurachan/cisTEM_simulate_pytorch
+
+## Update 20260825
+
+Upload unbend_pytorch_v2.py, which utilize nvtiff and nvimgcodec to decompress the LZW tiff files.
+
 # Advantage
 
 Using pytorch means the software runs on GPUs. When running on single RTX 4090, unbend is equal to about 30 CPU cores (half of the time is spent on decompress the tiff files),
