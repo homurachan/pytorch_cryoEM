@@ -6,7 +6,7 @@ pytorch implementation (by ChatGPT 5.5 and 5.6) of many cryo-EM softwares. Right
 
 pytorch, numpy, mrcfile, tifffile, imagecodecs, matplotlib
 
-For unbend_pytorch_v2, nvidia-nvimgcodec-cu12[nvtiff] is needed.
+For unbend_pytorch_v2, nvidia-nvimgcodec-cu12[nvtiff], and nvidia-nvjpeg2k-cu12 is needed.
 
 # Contents
 
@@ -26,6 +26,14 @@ Example usage:
 python ctffind5_pytorch.py "Your_*_sum_doseweighted.mrc" --output micrographs_ctf.star  --pixel-size $pixel_size --voltage 300 --cs 2.7  --box-size 512 --amplitude-contrast 0.07 --min-resolution 30 --max-resolution 5 --min-defocus 3000 --max-defocus 50000 --defocus-step 100 --output-star micrographs_ctf.star  --output-tsv micrographs_ctf.tsv --output-ctffind micrographs_ctf.txt  --output-avrot micrographs_avrot.txt --fit-tilt --estimate-thickness --gpu-ids all
 
 If you don't need to fit the tilted micrographs, remove --fit-tilt.
+
+Upload the multi-GPU supported unbend_pytorch_v2.py.
+
+Example usage:
+
+python unbend_pytorch_v2_multi_gpu.py "*.tif" corr_folder --pixel-size $pixel_size --output-binning 2 --gpu-ids 0,1,2,3,4,5,6,7 --exposure-per-frame $dose_per_frame  --voltage 300 --gain gain.mrc
+
+A folder named corr_folder will be created, and the corrected micrographs and corresponding png files will be stored there.
 
 ## Update 20260825
 
