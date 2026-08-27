@@ -14,7 +14,18 @@ For unbend_pytorch_v2, nvidia-nvimgcodec-cu12[nvtiff] is needed.
 
 2. The pytorch-implementation of [ctffind 4.1.8](https://grigoriefflab.umassmed.edu/ctffind4) and [ctftilt](https://grigoriefflab.umassmed.edu/ctf_estimation_ctffind_ctftilt)
 
-3. The pytorch-implementation of cisTEM-simulate is here: https://github.com/homurachan/cisTEM_simulate_pytorch
+3. The pytorch-implementation of [ctffind 5](https://elifesciences.org/reviewed-preprints/97227v2)
+
+4. The pytorch-implementation of cisTEM-simulate is here: https://github.com/homurachan/cisTEM_simulate_pytorch
+
+## Update 20260826
+
+Upload ctffind5_pytorch.py. It is a pytorch implement of ctffind 5. The --fit-tilt is much more stable than the ctftilt implementation. However, the untilted defocus estimation is not as fast as the ctffind 4.1.8 as the EPA and ice-thickness need more optimization.
+
+Example usage:
+python ctffind5_pytorch.py "Your_*_sum_doseweighted.mrc" --output micrographs_ctf.star  --pixel-size $pixel_size --voltage 300 --cs 2.7  --box-size 512 --amplitude-contrast 0.07 --min-resolution 30 --max-resolution 5 --min-defocus 3000 --max-defocus 50000 --defocus-step 100 --output-star micrographs_ctf.star  --output-tsv micrographs_ctf.tsv --output-ctffind micrographs_ctf.txt  --output-avrot micrographs_avrot.txt --fit-tilt --estimate-thickness --gpu-ids all
+
+If you don't need to fit the tilted micrographs, remove --fit-tilt.
 
 ## Update 20260825
 
