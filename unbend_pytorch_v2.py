@@ -1,5 +1,6 @@
+#!/usr/bin/env python3
 """
-unbend_pytorch.py
+unbend_pytorch_v2_multi_gpu.py
 
 Standalone PyTorch reimplementation of the core motion-correction and
 patch-based distortion-correction path in unbend.cpp.
@@ -35,6 +36,12 @@ Supported input:
     nvTIFF GPU decoding is attempted first and automatically falls back to
     tifffile/imagecodecs if unavailable, unsupported, or out of GPU memory.
 
+Batch and multi-GPU input:
+    Quote a file glob such as "*.tif" and use an output directory. One
+    persistent spawned worker is bound to each selected GPU, and each worker
+    processes one complete movie stack at a time. Worker startup is serialized
+    so separate processes never import PyTorch from NFS simultaneously.
+
 Not supported without extra decoders:
     EER movie decoding and DM4 gain/dark references.
 
@@ -47,23 +54,25 @@ The implementation keeps the original algorithmic structure:
   5. nonlinear frame resampling;
   6. cisTEM-compatible exposure weighting and optional noise-power restore.
 """
-# changelog v2
-# Add nvimgcodec and nvtiff support. Callback to cpu if out of memory or have no nvtiff installed.
-# Add patch png for better presentation by default. You can turn it off by adding --no-patch-plot
+
 from __future__ import annotations
 
 import argparse
 import binascii
 import gc
+import glob
 import math
+import multiprocessing as mp
 import os
+import queue
 import struct
 import sys
 import time
+import traceback
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Any, Iterable, Optional, Sequence, Tuple
 
 import mrcfile
 import numpy as np
@@ -73,10 +82,17 @@ import torch.nn.functional as F
 
 Tensor = torch.Tensor
 EPS = 1.0e-12
+_LOG_PREFIX = ""
+
+
+def set_log_prefix(prefix: str) -> None:
+    """Set a process-local prefix so concurrent worker logs remain readable."""
+    global _LOG_PREFIX
+    _LOG_PREFIX = str(prefix)
 
 
 def log(message: str) -> None:
-    print(message, flush=True)
+    print(f"{_LOG_PREFIX}{message}", flush=True)
 
 
 def odd_at_least(value: int, minimum: int = 3) -> int:
@@ -2867,14 +2883,92 @@ def validate_arguments(args: argparse.Namespace, n_frames: int) -> None:
 
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="GPU PyTorch motion correction and patch-based distortion correction for MRC movies.",
+        description=(
+            "GPU PyTorch motion correction and patch-based distortion correction "
+            "for MRC/TIFF movies, with persistent one-stack-per-GPU batch scheduling."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("input", help="Input MRC/MRCS or TIFF movie stack")
-    parser.add_argument("output", help="Output aligned/dose-weighted MRC sum")
-    parser.add_argument("--pixel-size", type=float, required=True, help="Input physical pixel size in Angstrom")
+    parser.add_argument(
+        "input",
+        help=(
+            "Input MRC/MRCS or TIFF movie stack, or a quoted glob such as "
+            "'*.tif'. A glob/batch uses OUTPUT as a directory."
+        ),
+    )
+    parser.add_argument(
+        "output",
+        help=(
+            "Single input: exact output MRC filename. Glob/multi-device input: "
+            "output directory containing one MRC sum per input stack."
+        ),
+    )
+    parser.add_argument(
+        "--pixel-size",
+        type=float,
+        required=True,
+        help="Input physical pixel size in Angstrom",
+    )
     parser.add_argument("--output-binning", type=float, default=1.0)
-    parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, ...")
+
+    device_group = parser.add_mutually_exclusive_group()
+    device_group.add_argument(
+        "--device",
+        default="auto",
+        help=(
+            "Single-device selection: auto, cpu, cuda, cuda:0, ... . In glob "
+            "mode, auto uses all visible CUDA GPUs (or one CPU worker)."
+        ),
+    )
+    device_group.add_argument(
+        "--devices",
+        default=None,
+        metavar="DEVICE,DEVICE,...",
+        help=(
+            "Explicit persistent-worker devices, e.g. cuda:0,cuda:1,cuda:2. "
+            "CPU entries are accepted for scheduler testing."
+        ),
+    )
+    device_group.add_argument(
+        "--gpu-ids",
+        default=None,
+        metavar="IDS",
+        help=(
+            "CUDA shorthand for persistent workers: 0,1,2,3; 0-3; or all. "
+            "IDs are logical after CUDA_VISIBLE_DEVICES is applied."
+        ),
+    )
+    parser.add_argument(
+        "--worker-cpu-threads",
+        type=int,
+        default=0,
+        help=(
+            "CPU threads per persistent batch worker; 0 chooses automatically, "
+            "capped by --cpu-threads and four threads per worker."
+        ),
+    )
+    parser.add_argument(
+        "--output-suffix",
+        default="_unbend.mrc",
+        help="Filename suffix appended to each input stem in glob/batch mode",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="In batch mode, skip output MRC files larger than the 1024-byte header",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Keep other persistent workers running after one movie fails",
+    )
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=1,
+        help="Print a parent-process batch progress line every N completed movies; 0 disables",
+    )
+
     parser.add_argument(
         "--tiff-decoder",
         choices=("auto", "nvtiff", "cpu"),
@@ -2884,35 +2978,102 @@ def make_parser() -> argparse.ArgumentParser:
             "falls back to tifffile/imagecodecs after any failure or CUDA OOM"
         ),
     )
-    parser.add_argument("--cpu-threads", type=int, default=min(8, os.cpu_count() or 1), help="PyTorch CPU worker threads; limiting this avoids FFT/LAPACK oversubscription")
-    parser.add_argument("--align-batch", type=int, default=1, help="Frames per FFT/correlation batch during alignment. Use 1 for lowest memory; larger values are faster but use more memory.")
-    parser.add_argument("--output-dir", default=None, help="Directory for shift/model/log files when --write-log-files is enabled")
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+        help=(
+            "PyTorch CPU threads in single-device mode, and the upper bound used "
+            "for automatic per-worker thread selection"
+        ),
+    )
+    parser.add_argument(
+        "--align-batch",
+        type=int,
+        default=1,
+        help=(
+            "Frames per FFT/correlation batch during alignment. Use 1 for lowest "
+            "memory; larger values are faster but use more memory."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help=(
+            "Single input: directory for shift/model/log files. Batch input: root "
+            "directory; a separate INPUT_STEM_unbend subdirectory is created. "
+            "A template containing {stem} and/or {index} is also accepted."
+        ),
+    )
     parser.add_argument(
         "--write-log-files",
         action="store_true",
-        help="Write full-frame, patch, spline-control, patch_shift.txt, and NPZ log/model files. Default is off.",
+        help=(
+            "Write full-frame, patch, spline-control, patch_shift.txt, and NPZ "
+            "log/model files. Default is off."
+        ),
     )
 
-    parser.add_argument("--minimum-shift", type=float, default=2.0, help="Initial inner search radius in Angstrom")
-    parser.add_argument("--maximum-shift", type=float, default=100.0, help="Per-iteration outer search radius in Angstrom")
-    parser.add_argument("--termination", type=float, default=None, help="Convergence threshold in Angstrom")
+    parser.add_argument(
+        "--minimum-shift",
+        type=float,
+        default=2.0,
+        help="Initial inner search radius in Angstrom",
+    )
+    parser.add_argument(
+        "--maximum-shift",
+        type=float,
+        default=100.0,
+        help="Per-iteration outer search radius in Angstrom",
+    )
+    parser.add_argument(
+        "--termination",
+        type=float,
+        default=None,
+        help="Convergence threshold in Angstrom",
+    )
     parser.add_argument("--max-iterations", type=int, default=20)
-    parser.add_argument("--bfactor", type=float, default=1500.0, help="Alignment low-pass B-factor in A^2")
+    parser.add_argument(
+        "--bfactor",
+        type=float,
+        default=1500.0,
+        help="Alignment low-pass B-factor in A^2",
+    )
     parser.add_argument("--running-average", type=int, default=1)
-    parser.add_argument("--smooth-global-shifts", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--mask-central-cross", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--smooth-global-shifts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--mask-central-cross",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--vertical-mask-size", type=int, default=1)
     parser.add_argument("--horizontal-mask-size", type=int, default=1)
 
-    parser.add_argument("--gain", default=None, help="MRC gain reference; multiplication convention")
-    parser.add_argument("--dark", default=None, help="MRC dark reference")
-    parser.add_argument("--replace-outliers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--gain", default=None, help="MRC/TIFF gain reference; multiplication convention")
+    parser.add_argument("--dark", default=None, help="MRC/TIFF dark reference")
+    parser.add_argument(
+        "--replace-outliers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--mag-distortion-angle", type=float, default=0.0)
     parser.add_argument("--mag-distortion-major", type=float, default=1.0)
     parser.add_argument("--mag-distortion-minor", type=float, default=1.0)
 
-    parser.add_argument("--patch-correction", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--distortion-model", choices=("linear", "quadratic", "spline"), default="spline")
+    parser.add_argument(
+        "--patch-correction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--distortion-model",
+        choices=("linear", "quadratic", "spline"),
+        default="spline",
+    )
     parser.add_argument("--patch-num-x", type=int, default=0)
     parser.add_argument("--patch-num-y", type=int, default=0)
     parser.add_argument("--patch-size", type=int, default=0)
@@ -2925,7 +3086,10 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--patch-plot-file",
         default=None,
-        help="PNG path; default is OUTPUT_STEM_patch_displacement.png",
+        help=(
+            "PNG path; default is OUTPUT_STEM_patch_displacement.png. In multi-input "
+            "mode, use a directory or a template containing {stem}/{index}."
+        ),
     )
     parser.add_argument(
         "--patch-plot-frame",
@@ -2941,9 +3105,23 @@ def make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--patch-running-average", type=int, default=5)
     parser.add_argument("--patch-max-iterations", type=int, default=None)
-    parser.add_argument("--spline-residual-refine", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--spline-r1-iterations", type=int, default=50, help="LBFGS iterations for continuous CC-map spline refinement")
-    parser.add_argument("--warp-mode", choices=("cistem", "inverse"), default="cistem", help="cistem reproduces Image::Distortion; inverse uses fixed-point grid sampling")
+    parser.add_argument(
+        "--spline-residual-refine",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--spline-r1-iterations",
+        type=int,
+        default=50,
+        help="LBFGS iterations for continuous CC-map spline refinement",
+    )
+    parser.add_argument(
+        "--warp-mode",
+        choices=("cistem", "inverse"),
+        default="cistem",
+        help="cistem reproduces Image::Distortion; inverse uses fixed-point grid sampling",
+    )
     parser.add_argument(
         "--warp-domain",
         choices=("raw", "output"),
@@ -2951,21 +3129,41 @@ def make_parser() -> argparse.ArgumentParser:
         help="raw is more faithful; output uses less memory/time",
     )
 
-    parser.add_argument("--dose-filter", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--restore-power", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--voltage", type=float, default=300.0, choices=(100.0, 200.0, 300.0))
+    parser.add_argument(
+        "--dose-filter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--restore-power",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--voltage",
+        type=float,
+        default=300.0,
+        choices=(100.0, 200.0, 300.0),
+    )
     parser.add_argument("--exposure-per-frame", type=float, default=1.0)
     parser.add_argument("--pre-exposure", type=float, default=0.0)
     parser.add_argument("--first-frame", type=int, default=1)
     parser.add_argument("--last-frame", type=int, default=0, help="0 means final frame")
-    parser.add_argument("--save-aligned-frames", default=None, metavar="OUTPUT_STACK.MRC")
+    parser.add_argument(
+        "--save-aligned-frames",
+        default=None,
+        metavar="OUTPUT_STACK.MRC_OR_DIRECTORY",
+        help=(
+            "Optional aligned-frame stack. In multi-input mode, use a directory "
+            "or a template containing {stem}/{index}."
+        ),
+    )
     parser.add_argument("--deterministic", action="store_true")
     return parser
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = make_parser()
-    args = parser.parse_args(argv)
+def run_single(args: argparse.Namespace) -> int:
+    """Run the original v2 algorithm for exactly one movie stack."""
     torch.set_num_threads(args.cpu_threads)
     try:
         torch.set_num_interop_threads(1)
@@ -3201,7 +3399,801 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
+
+# ---------------------------------------------------------------------------
+# Persistent multi-device batch scheduler
+# ---------------------------------------------------------------------------
+
+
+def _parse_gpu_ids(value: str) -> list[int]:
+    """Parse comma-separated logical GPU IDs and compact inclusive ranges."""
+    ids: list[int] = []
+    for raw_token in value.split(","):
+        token = raw_token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            pieces = token.split("-", 1)
+            if len(pieces) != 2:
+                raise ValueError(f"Invalid GPU range {token!r}")
+            first = int(pieces[0])
+            last = int(pieces[1])
+            if first < 0 or last < first:
+                raise ValueError(f"Invalid GPU range {token!r}")
+            ids.extend(range(first, last + 1))
+        else:
+            gpu_id = int(token)
+            if gpu_id < 0:
+                raise ValueError("GPU IDs must be non-negative")
+            ids.append(gpu_id)
+    if not ids:
+        raise ValueError("No GPU IDs were supplied")
+    if len(ids) != len(set(ids)):
+        raise ValueError("Duplicate GPU IDs are not allowed")
+    return ids
+
+
+def _expand_input_files(input_value: str) -> list[str]:
+    """Expand one literal input path or one quoted glob in deterministic order."""
+    expanded = os.path.expanduser(os.path.expandvars(input_value))
+    if glob.has_magic(expanded):
+        candidates = glob.glob(expanded, recursive=True)
+    else:
+        candidates = [expanded]
+
+    paths: list[str] = []
+    seen: set[str] = set()
+    for candidate in sorted(candidates, key=lambda item: os.path.normcase(str(item))):
+        path = Path(candidate)
+        if not path.is_file():
+            continue
+        resolved = str(path.resolve())
+        key = os.path.normcase(resolved)
+        if key not in seen:
+            seen.add(key)
+            paths.append(resolved)
+    if not paths:
+        if glob.has_magic(expanded):
+            raise FileNotFoundError(f"Input pattern matched no files: {input_value}")
+        raise FileNotFoundError(f"Input file does not exist: {input_value}")
+    return paths
+
+
+def _normalize_device_string(value: str) -> str:
+    try:
+        device = torch.device(value.strip())
+    except Exception as exc:
+        raise ValueError(
+            f"Invalid device string {value!r}. Use --device cuda:N for one GPU, "
+            "or --gpu-ids/--devices for multiple GPUs."
+        ) from exc
+    if device.type == "cuda":
+        index = 0 if device.index is None else int(device.index)
+        if index < 0:
+            raise ValueError(f"Invalid CUDA device index in {value!r}")
+        return f"cuda:{index}"
+    if device.type == "cpu":
+        return "cpu"
+    raise ValueError(f"Batch workers support CUDA or CPU devices, not {value!r}")
+
+
+def _select_batch_devices(args: argparse.Namespace) -> list[str]:
+    """Return logical worker devices before per-process CUDA isolation."""
+    if args.gpu_ids is not None:
+        if args.gpu_ids.strip().lower() == "all":
+            count = int(torch.cuda.device_count())
+            if count < 1:
+                raise RuntimeError("--gpu-ids all requested, but no CUDA GPUs are visible")
+            devices = [f"cuda:{index}" for index in range(count)]
+        else:
+            devices = [f"cuda:{index}" for index in _parse_gpu_ids(args.gpu_ids)]
+    elif args.devices is not None:
+        raw = [item.strip() for item in args.devices.split(",") if item.strip()]
+        if not raw:
+            raise ValueError("--devices requires at least one device")
+        devices = [_normalize_device_string(item) for item in raw]
+    else:
+        requested = args.device.strip().lower()
+        if requested == "auto":
+            if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+                devices = [f"cuda:{index}" for index in range(torch.cuda.device_count())]
+            else:
+                devices = ["cpu"]
+        else:
+            devices = [_normalize_device_string(requested)]
+
+    cuda_devices = [item for item in devices if item.startswith("cuda:")]
+    if cuda_devices:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA workers were requested, but torch.cuda.is_available() is False")
+        visible = int(torch.cuda.device_count())
+        seen: set[int] = set()
+        for spec in cuda_devices:
+            index = int(spec.split(":", 1)[1])
+            if index >= visible:
+                raise ValueError(
+                    f"Requested {spec}, but only {visible} logical CUDA device(s) are visible. "
+                    "GPU IDs are interpreted after CUDA_VISIBLE_DEVICES."
+                )
+            if index in seen:
+                raise ValueError(f"Duplicate CUDA worker device: {spec}")
+            seen.add(index)
+    return devices
+
+
+def _recognized_template(value: str) -> bool:
+    return any(token in value for token in ("{stem}", "{name}", "{index}"))
+
+
+def _format_task_template(value: str, task: dict[str, Any]) -> str:
+    if not _recognized_template(value):
+        return value
+    try:
+        return value.format(
+            stem=task["stem"],
+            name=Path(task["input"]).name,
+            index=int(task["index"]) + 1,
+        )
+    except (KeyError, IndexError, ValueError) as exc:
+        raise ValueError(f"Invalid batch path template {value!r}: {exc}") from exc
+
+
+def _resolve_batch_file_option(
+    value: Optional[str],
+    task: dict[str, Any],
+    total_tasks: int,
+    default_filename: str,
+    expected_suffixes: tuple[str, ...],
+    option_name: str,
+) -> Optional[str]:
+    """Resolve a per-task optional file path without allowing worker collisions."""
+    if value is None:
+        return None
+    if _recognized_template(value):
+        return str(Path(_format_task_template(value, task)))
+
+    path = Path(value)
+    suffix = path.suffix.lower()
+    if total_tasks == 1 and suffix in expected_suffixes:
+        return str(path)
+    if path.is_dir() or suffix == "":
+        return str(path / default_filename)
+    raise ValueError(
+        f"{option_name}={value!r} would be shared by multiple inputs. Use a directory "
+        "or include {stem} or {index} in the path."
+    )
+
+
+def _build_batch_tasks(args: argparse.Namespace, input_files: Sequence[str]) -> list[dict[str, Any]]:
+    """Create collision-free per-movie paths for an input glob/batch."""
+    output_root = Path(os.path.expanduser(os.path.expandvars(args.output)))
+    if output_root.exists() and not output_root.is_dir():
+        raise ValueError(f"Batch OUTPUT must be a directory, but this is a file: {output_root}")
+    if not output_root.exists() and output_root.suffix.lower() in {".mrc", ".mrcs"}:
+        raise ValueError(
+            "A glob or multi-device run requires OUTPUT to be a directory, not an MRC filename"
+        )
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    suffix = str(args.output_suffix)
+    if not suffix:
+        raise ValueError("--output-suffix must not be empty")
+    if Path(suffix).name != suffix or "/" in suffix or "\\" in suffix:
+        raise ValueError("--output-suffix must be a filename suffix, not a path")
+
+    tasks: list[dict[str, Any]] = []
+    total = len(input_files)
+    for index, input_file in enumerate(input_files):
+        stem = Path(input_file).stem
+        task: dict[str, Any] = {
+            "index": index,
+            "input": str(input_file),
+            "stem": stem,
+            "output": str(output_root / f"{stem}{suffix}"),
+        }
+
+        if args.output_dir is not None:
+            if _recognized_template(args.output_dir):
+                log_dir = _format_task_template(args.output_dir, task)
+            else:
+                log_dir = str(Path(args.output_dir) / f"{stem}_unbend")
+        else:
+            log_dir = str((output_root / f"{stem}_unbend"))
+        task["output_dir"] = log_dir
+
+        task["patch_plot_file"] = _resolve_batch_file_option(
+            args.patch_plot_file,
+            task,
+            total,
+            f"{stem}{suffix.rsplit('.', 1)[0] if '.' in suffix else suffix}_patch_displacement.png",
+            (".png",),
+            "--patch-plot-file",
+        )
+        task["save_aligned_frames"] = _resolve_batch_file_option(
+            args.save_aligned_frames,
+            task,
+            total,
+            f"{stem}_aligned_frames.mrc",
+            (".mrc", ".mrcs"),
+            "--save-aligned-frames",
+        )
+        tasks.append(task)
+
+    generated: dict[str, tuple[str, str]] = {}
+    for task in tasks:
+        candidates: list[tuple[str, Optional[str]]] = [("output", task["output"])]
+        if args.write_log_files:
+            candidates.append(("log directory", task["output_dir"]))
+        if task["patch_plot_file"] is not None:
+            candidates.append(("patch plot", task["patch_plot_file"]))
+        if task["save_aligned_frames"] is not None:
+            candidates.append(("aligned frames", task["save_aligned_frames"]))
+        for kind, candidate in candidates:
+            if candidate is None:
+                continue
+            key = os.path.normcase(str(Path(candidate).absolute()))
+            previous = generated.get(key)
+            if previous is not None:
+                prev_kind, prev_input = previous
+                raise RuntimeError(
+                    f"Batch output collision at {candidate}: {kind} for {task['input']} "
+                    f"conflicts with {prev_kind} for {prev_input}. Inputs with identical "
+                    "basenames need separate runs or renamed files."
+                )
+            generated[key] = (kind, task["input"])
+    return tasks
+
+
+def _existing_output_is_complete_enough(filename: str) -> bool:
+    try:
+        return Path(filename).is_file() and Path(filename).stat().st_size > 1024
+    except OSError:
+        return False
+
+
+def _task_namespace(
+    base_values: dict[str, Any],
+    task: dict[str, Any],
+    runtime_device: str,
+    cpu_threads: int,
+) -> argparse.Namespace:
+    values = dict(base_values)
+    values.update(
+        input=task["input"],
+        output=task["output"],
+        output_dir=task["output_dir"],
+        patch_plot_file=task["patch_plot_file"],
+        save_aligned_frames=task["save_aligned_frames"],
+        device=runtime_device,
+        devices=None,
+        gpu_ids=None,
+        cpu_threads=int(cpu_threads),
+        last_frame=int(base_values.get("last_frame", 0)),
+    )
+    return argparse.Namespace(**values)
+
+
+def _automatic_worker_threads(args: argparse.Namespace, worker_count: int) -> int:
+    if args.worker_cpu_threads < 0:
+        raise ValueError("--worker-cpu-threads must be >= 0")
+    if args.worker_cpu_threads > 0:
+        return int(args.worker_cpu_threads)
+    logical_cpus = max(1, int(os.cpu_count() or 1))
+    per_worker_budget = max(1, logical_cpus // max(1, worker_count))
+    return max(1, min(int(args.cpu_threads), 4, per_worker_budget))
+
+
+def _worker_specs(logical_devices: Sequence[str]) -> list[dict[str, Any]]:
+    """Map logical CUDA IDs to one-device CUDA_VISIBLE_DEVICES child environments."""
+    inherited = os.environ.get("CUDA_VISIBLE_DEVICES")
+    inherited_tokens: Optional[list[str]] = None
+    if inherited is not None and inherited.strip() not in {"", "-1"}:
+        inherited_tokens = [token.strip() for token in inherited.split(",") if token.strip()]
+
+    counts: dict[str, int] = {}
+    for logical_label in logical_devices:
+        counts[str(logical_label)] = counts.get(str(logical_label), 0) + 1
+
+    specs: list[dict[str, Any]] = []
+    for worker_index, logical_label_value in enumerate(logical_devices):
+        logical_label = str(logical_label_value)
+        display_label = (
+            logical_label
+            if counts[logical_label] == 1
+            else f"{logical_label}/w{worker_index}"
+        )
+        device = torch.device(logical_label)
+        if device.type == "cuda":
+            logical_index = 0 if device.index is None else int(device.index)
+            if inherited_tokens is not None:
+                if logical_index >= len(inherited_tokens):
+                    raise ValueError(
+                        f"Logical {logical_label} is outside CUDA_VISIBLE_DEVICES={inherited!r}"
+                    )
+                child_visible = inherited_tokens[logical_index]
+            else:
+                child_visible = str(logical_index)
+            runtime_device = "cuda:0"
+        else:
+            child_visible = ""
+            runtime_device = "cpu"
+        specs.append(
+            {
+                "worker_index": worker_index,
+                "label": display_label,
+                "logical_label": logical_label,
+                "cuda_visible_devices": child_visible,
+                "runtime_device": runtime_device,
+            }
+        )
+    return specs
+
+
+def _persistent_worker_loop(
+    spec: dict[str, Any],
+    base_values: dict[str, Any],
+    task_queue: Any,
+    result_queue: Any,
+    cpu_threads: int,
+) -> None:
+    """One long-lived process, isolated to one GPU, processing complete stacks."""
+    worker_index = int(spec["worker_index"])
+    label = str(spec["label"])
+    runtime_device = str(spec["runtime_device"])
+    try:
+        torch.set_num_threads(max(1, int(cpu_threads)))
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+        device = available_device(runtime_device)
+        if device.type == "cuda":
+            torch.cuda.set_device(0)
+            # Force CUDA runtime/context initialization before the parent starts
+            # the next worker. This keeps both Python/PyTorch import and CUDA
+            # shared-library loading serialized on NFS installations.
+            probe = torch.empty(1, dtype=torch.float32, device=device)
+            del probe
+            torch.cuda.synchronize(device)
+            device_name = torch.cuda.get_device_name(device)
+        else:
+            device_name = "CPU"
+        result_queue.put(
+            {
+                "kind": "ready",
+                "worker_index": worker_index,
+                "label": label,
+                "pid": os.getpid(),
+                "device_name": device_name,
+            }
+        )
+    except BaseException as exc:
+        result_queue.put(
+            {
+                "kind": "fatal",
+                "worker_index": worker_index,
+                "label": label,
+                "pid": os.getpid(),
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
+        return
+
+    while True:
+        task = task_queue.get()
+        if task is None:
+            break
+        started = time.perf_counter()
+        set_log_prefix(f"[{label} | {task['stem']}] ")
+        try:
+            task_args = _task_namespace(base_values, task, runtime_device, cpu_threads)
+            return_code = run_single(task_args)
+            if return_code != 0:
+                raise RuntimeError(f"run_single returned exit status {return_code}")
+            elapsed = time.perf_counter() - started
+            result_queue.put(
+                {
+                    "kind": "done",
+                    "worker_index": worker_index,
+                    "label": label,
+                    "task_index": int(task["index"]),
+                    "input": task["input"],
+                    "output": task["output"],
+                    "elapsed_s": float(elapsed),
+                }
+            )
+        except BaseException as exc:
+            error_traceback = traceback.format_exc()
+            gc.collect()
+            if runtime_device.startswith("cuda"):
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            result_queue.put(
+                {
+                    "kind": "error",
+                    "worker_index": worker_index,
+                    "label": label,
+                    "task_index": int(task["index"]),
+                    "input": task["input"],
+                    "output": task["output"],
+                    "elapsed_s": float(time.perf_counter() - started),
+                    "error": str(exc),
+                    "traceback": error_traceback,
+                }
+            )
+        finally:
+            set_log_prefix("")
+            gc.collect()
+            if runtime_device.startswith("cuda"):
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+    result_queue.put(
+        {
+            "kind": "stopped",
+            "worker_index": worker_index,
+            "label": label,
+            "pid": os.getpid(),
+        }
+    )
+
+
+def _restore_environment(name: str, existed: bool, value: Optional[str]) -> None:
+    if existed:
+        assert value is not None
+        os.environ[name] = value
+    else:
+        os.environ.pop(name, None)
+
+
+def _start_bound_worker(
+    context: Any,
+    spec: dict[str, Any],
+    base_values: dict[str, Any],
+    task_queue: Any,
+    result_queue: Any,
+    cpu_threads: int,
+) -> mp.Process:
+    """Spawn one child with GPU binding and thread limits set before imports."""
+    process = context.Process(
+        target=_persistent_worker_loop,
+        args=(spec, base_values, task_queue, result_queue, cpu_threads),
+        name=f"unbend-{str(spec['label']).replace(':', '-').replace('/', '-')}",
+    )
+
+    temporary_environment = {
+        "CUDA_VISIBLE_DEVICES": str(spec["cuda_visible_devices"]),
+        "CUDA_DEVICE_ORDER": os.environ.get("CUDA_DEVICE_ORDER", "PCI_BUS_ID"),
+        "OMP_NUM_THREADS": str(cpu_threads),
+        "MKL_NUM_THREADS": str(cpu_threads),
+        "OPENBLAS_NUM_THREADS": str(cpu_threads),
+        "NUMEXPR_NUM_THREADS": str(cpu_threads),
+    }
+    previous: dict[str, tuple[bool, Optional[str]]] = {}
+    for name, value in temporary_environment.items():
+        previous[name] = (name in os.environ, os.environ.get(name))
+        os.environ[name] = value
+    try:
+        process.start()
+    finally:
+        for name, (existed, value) in previous.items():
+            _restore_environment(name, existed, value)
+    return process
+
+
+def _wait_for_serial_worker_ready(
+    process: mp.Process,
+    expected_spec: dict[str, Any],
+    result_queue: Any,
+    startup_started: float,
+) -> dict[str, Any]:
+    expected_index = int(expected_spec["worker_index"])
+    while True:
+        try:
+            message = result_queue.get(timeout=1.0)
+        except queue.Empty:
+            if not process.is_alive() and process.exitcode is not None:
+                raise RuntimeError(
+                    f"Worker {expected_index} ({expected_spec['label']}) exited with "
+                    f"code {process.exitcode} while importing/initializing PyTorch"
+                )
+            continue
+        kind = message.get("kind")
+        worker_index = int(message.get("worker_index", -1))
+        if worker_index != expected_index:
+            raise RuntimeError(
+                f"Unexpected startup message from worker {worker_index} while waiting "
+                f"for worker {expected_index}: {message!r}"
+            )
+        if kind == "ready":
+            elapsed = time.perf_counter() - startup_started
+            print(
+                f"Worker {worker_index} ready on {message['label']} "
+                f"({message['device_name']}, PID {message['pid']}); serialized "
+                f"spawn/import/CUDA init {elapsed:.2f} s",
+                flush=True,
+            )
+            return message
+        if kind == "fatal":
+            raise RuntimeError(
+                f"Worker {worker_index} ({message['label']}) failed during startup:\n"
+                f"{message['traceback']}"
+            )
+        raise RuntimeError(f"Unexpected worker startup message: {message!r}")
+
+
+def _terminate_workers(processes: Sequence[mp.Process]) -> None:
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    for process in processes:
+        process.join(timeout=5.0)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5.0)
+
+
+def _run_batch_single_device(
+    args: argparse.Namespace,
+    tasks: Sequence[dict[str, Any]],
+    device_spec: str,
+    cpu_threads: int,
+) -> int:
+    """Persistent one-process batch path when only one device is selected."""
+    print(
+        f"Batch mode: one persistent process on {device_spec}; {len(tasks)} movie stack(s)",
+        flush=True,
+    )
+    base_values = dict(vars(args))
+    failures: list[dict[str, Any]] = []
+    completed = 0
+    for task in tasks:
+        set_log_prefix(f"[{device_spec} | {task['stem']}] ")
+        started = time.perf_counter()
+        try:
+            task_args = _task_namespace(base_values, task, device_spec, cpu_threads)
+            run_single(task_args)
+            elapsed = time.perf_counter() - started
+            completed += 1
+            if args.progress_every > 0 and (
+                completed % args.progress_every == 0 or completed == len(tasks)
+            ):
+                print(
+                    f"Batch progress: {completed}/{len(tasks)} completed; "
+                    f"latest {Path(task['input']).name} on {device_spec} in {elapsed:.2f} s",
+                    flush=True,
+                )
+        except BaseException as exc:
+            failure = {
+                "input": task["input"],
+                "output": task["output"],
+                "device": device_spec,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+            failures.append(failure)
+            if not args.continue_on_error:
+                raise
+            print(
+                f"ERROR: {task['input']} failed on {device_spec}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+        finally:
+            set_log_prefix("")
+            gc.collect()
+            if device_spec.startswith("cuda"):
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+    print(
+        f"Batch completed: {completed} succeeded, {len(failures)} failed",
+        flush=True,
+    )
+    return 1 if failures else 0
+
+
+def _run_batch_multi_device(
+    args: argparse.Namespace,
+    tasks: Sequence[dict[str, Any]],
+    logical_devices: Sequence[str],
+    cpu_threads: int,
+) -> int:
+    """Run a dynamic one-complete-stack-per-GPU persistent worker queue."""
+    worker_count = min(len(logical_devices), len(tasks))
+    selected_devices = list(logical_devices[:worker_count])
+    specs = _worker_specs(selected_devices)
+    print(
+        f"Multi-GPU batch mode: {worker_count} persistent worker(s), one complete "
+        "movie stack per worker at a time",
+        flush=True,
+    )
+    print("Worker devices: " + ", ".join(selected_devices), flush=True)
+    print(
+        "Worker startup is serialized: each child finishes Python/PyTorch import "
+        "and CUDA initialization before the next child is spawned.",
+        flush=True,
+    )
+    print(f"Per-worker CPU threads: {cpu_threads}", flush=True)
+
+    context = mp.get_context("spawn")
+    task_queue = context.Queue()
+    result_queue = context.Queue()
+    processes: list[mp.Process] = []
+    base_values = dict(vars(args))
+
+    try:
+        for spec in specs:
+            startup_started = time.perf_counter()
+            process = _start_bound_worker(
+                context,
+                spec,
+                base_values,
+                task_queue,
+                result_queue,
+                cpu_threads,
+            )
+            processes.append(process)
+            _wait_for_serial_worker_ready(process, spec, result_queue, startup_started)
+
+        for task in tasks:
+            task_queue.put(task)
+        for _ in processes:
+            task_queue.put(None)
+
+        terminal = 0
+        succeeded = 0
+        failures: list[dict[str, Any]] = []
+        worker_labels = [str(spec["label"]) for spec in specs]
+        per_device: dict[str, dict[str, float | int]] = {
+            label: {"completed": 0, "busy_s": 0.0} for label in worker_labels
+        }
+        while terminal < len(tasks):
+            try:
+                message = result_queue.get(timeout=1.0)
+            except queue.Empty:
+                dead = [
+                    process
+                    for process in processes
+                    if not process.is_alive() and process.exitcode is not None
+                ]
+                if dead and all(not process.is_alive() for process in processes):
+                    details = ", ".join(
+                        f"{process.name}: exit {process.exitcode}" for process in dead
+                    )
+                    raise RuntimeError(
+                        "All workers exited before every movie reached a terminal state: "
+                        + details
+                    )
+                continue
+
+            kind = message.get("kind")
+            if kind == "stopped":
+                continue
+            if kind not in {"done", "error"}:
+                raise RuntimeError(f"Unexpected worker result message: {message!r}")
+
+            terminal += 1
+            label = str(message["label"])
+            elapsed = float(message.get("elapsed_s", 0.0))
+            per_device[label]["busy_s"] = float(per_device[label]["busy_s"]) + elapsed
+            if kind == "done":
+                succeeded += 1
+                per_device[label]["completed"] = int(per_device[label]["completed"]) + 1
+                if args.progress_every > 0 and (
+                    terminal % args.progress_every == 0 or terminal == len(tasks)
+                ):
+                    print(
+                        f"Batch progress: {terminal}/{len(tasks)} terminal, "
+                        f"{succeeded} succeeded; latest {Path(message['input']).name} "
+                        f"on {label} in {elapsed:.2f} s",
+                        flush=True,
+                    )
+            else:
+                failures.append(message)
+                print(
+                    f"ERROR: {message['input']} failed on {label}: {message['error']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if not args.continue_on_error:
+                    raise RuntimeError(
+                        f"Movie failed on {label}: {message['input']}\n"
+                        f"{message['traceback']}"
+                    )
+
+        for process in processes:
+            process.join(timeout=30.0)
+        lingering = [process for process in processes if process.is_alive()]
+        if lingering:
+            _terminate_workers(lingering)
+
+        print(
+            f"Batch completed: {succeeded} succeeded, {len(failures)} failed",
+            flush=True,
+        )
+        for label in worker_labels:
+            entry = per_device[label]
+            print(
+                f"  {label}: {int(entry['completed'])} completed, "
+                f"{float(entry['busy_s']):.2f} s summed busy time",
+                flush=True,
+            )
+        return 1 if failures else 0
+    except BaseException:
+        _terminate_workers(processes)
+        raise
+    finally:
+        # Fail-fast termination can leave queued tasks without readers. Do not
+        # wait for feeder threads in that case, or an NFS/worker failure could
+        # turn into a parent-process shutdown hang.
+        try:
+            task_queue.cancel_join_thread()
+            task_queue.close()
+        except Exception:
+            pass
+        try:
+            result_queue.cancel_join_thread()
+            result_queue.close()
+        except Exception:
+            pass
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = make_parser()
+    args = parser.parse_args(argv)
+    if args.progress_every < 0:
+        parser.error("--progress-every must be >= 0")
+    if args.worker_cpu_threads < 0:
+        parser.error("--worker-cpu-threads must be >= 0")
+
+    input_files = _expand_input_files(args.input)
+    input_is_glob = glob.has_magic(os.path.expanduser(os.path.expandvars(args.input)))
+    explicit_multi = args.gpu_ids is not None or args.devices is not None
+    batch_mode = input_is_glob or len(input_files) > 1 or explicit_multi
+
+    if not batch_mode:
+        args.input = input_files[0]
+        if args.skip_existing and _existing_output_is_complete_enough(args.output):
+            print(f"Skipping existing output: {args.output}", flush=True)
+            return 0
+        set_log_prefix("")
+        return run_single(args)
+
+    print(f"Batch input matched {len(input_files)} movie stack(s)", flush=True)
+    tasks = _build_batch_tasks(args, input_files)
+    if args.skip_existing:
+        pending: list[dict[str, Any]] = []
+        for task in tasks:
+            if _existing_output_is_complete_enough(task["output"]):
+                print(f"Skipping existing output: {task['output']}", flush=True)
+            else:
+                pending.append(task)
+        tasks = pending
+    if not tasks:
+        print("No pending movie stacks remain", flush=True)
+        return 0
+
+    devices = _select_batch_devices(args)
+    if not devices:
+        raise RuntimeError("No processing devices were selected")
+    devices = devices[: min(len(devices), len(tasks))]
+    cpu_threads = _automatic_worker_threads(args, len(devices))
+
+    if len(devices) == 1:
+        return _run_batch_single_device(args, tasks, devices[0], cpu_threads)
+    return _run_batch_multi_device(args, tasks, devices, cpu_threads)
+
+
 if __name__ == "__main__":
+    mp.freeze_support()
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
