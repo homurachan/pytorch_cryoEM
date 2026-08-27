@@ -4,7 +4,7 @@ pytorch implementation (by ChatGPT 5.5 and 5.6) of many cryo-EM softwares. Right
 
 ## Required libraries
 
-pytorch, numpy, scipy, mrcfile, tifffile, imagecodecs, matplotlib
+pytorch, numpy, mrcfile, tifffile, imagecodecs, matplotlib
 
 For unbend_pytorch_v2, nvidia-nvimgcodec-cu12[nvtiff] is needed.
 
