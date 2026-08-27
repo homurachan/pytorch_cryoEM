@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CTFFIND5-PyTorch 0.5.3: a wxWidgets-free PyTorch implementation of the
+CTFFIND5-PyTorch 0.5.4: a wxWidgets-free PyTorch implementation of the
 CTFFIND4/CTFFIND5 fitting pipeline for independent 2-D MRC micrographs.
 
 Implemented
@@ -20,6 +20,11 @@ Implemented
   - CTFFIND5 non-negative-angle / 0-360-degree-axis output convention
 * Optional CTFFIND5 node-based ice-thickness search with coupled 1-D
   thickness/defocus search and local 2-D CTF/thickness refinement
+* Built-in spawn-based multi-device scheduler:
+  - one persistent process per CUDA device
+  - one complete micrograph per worker at a time (never split across GPUs)
+  - dynamic queue scheduling for mixed tilt/untilt runtimes
+  - deterministic parent-side STAR/TSV/avrot merging
 
 Untilts and tilt-corrected spectra share the same full-2D filtering,
 standard CTF fitting, EPA/FRC, and optional thickness pipeline.
@@ -36,6 +41,11 @@ Example
         --min-resolution 30 --max-resolution 5 \
         --min-defocus 5000 --max-defocus 50000 \
         --defocus-step 500 --fit-tilt --estimate-thickness \
+        --output micrographs_ctf.star --ctf-dir CtfFind/job005
+
+Multi-GPU example (one micrograph per GPU worker):
+    python ctffind5_pytorch.py "MotionCorr/job003/*.mrc" \
+        --gpu-ids 0-3 --pixel-size 1.06 --fit-tilt --estimate-thickness \
         --output micrographs_ctf.star --ctf-dir CtfFind/job005
 """
 
@@ -57,7 +67,9 @@ import glob
 import hashlib
 import json
 import math
+import multiprocessing as mp
 import os
+import queue
 import struct
 import sys
 import time
@@ -75,7 +87,7 @@ import torch.nn.functional as F
 
 
 PI = math.pi
-VERSION = "0.5.3"
+VERSION = "0.5.4"
 
 
 def _add_timing(target: dict[str, float], name: str, seconds: float) -> None:
@@ -4171,7 +4183,7 @@ def _make_v04_tilt_config(config: CtffindConfig) -> _V04TiltConfig:
         tilt_tile_batch_size=max(1, int(config.tilt_tile_batch_size)),
         tilt_refine_iterations=max(1, int(config.tilt_refine_maxiter)),
         tilt_min_tiles=max(3, int(config.tilt_min_tiles)),
-        spectrum_batch_size=max(1, min(32, int(config.tilt_tile_batch_size))),
+        spectrum_batch_size=max(1, min(16, int(config.tilt_tile_batch_size))),
         debug=bool(config.debug),
     )
 def _v04_electron_wavelength_A(acceleration_voltage_kV: float) -> float:
@@ -8522,6 +8534,8 @@ def _write_timing_json(
     config: Optional[CtffindConfig] = None,
     resolved_device: Optional[torch.device] = None,
     diagnostic_output: Optional[bool] = None,
+    runtime_settings_extra: Optional[dict[str, object]] = None,
+    extra_payload: Optional[dict[str, object]] = None,
 ) -> None:
     stage_values: dict[str, list[float]] = {}
     for result in results:
@@ -8586,7 +8600,13 @@ def _write_timing_json(
             runtime_settings['cuda_device_name'] = torch.cuda.get_device_name(
                 resolved_device
             )
+        if runtime_settings_extra:
+            runtime_settings.update(runtime_settings_extra)
         payload['runtime_settings'] = runtime_settings
+    elif runtime_settings_extra:
+        payload['runtime_settings'] = dict(runtime_settings_extra)
+    if extra_payload:
+        payload.update(extra_payload)
     wall = float((program_timings or {}).get('program_total_wall_s', 0.0))
     if wall > 0.0 and results:
         payload['throughput_micrographs_per_second'] = float(
@@ -8611,17 +8631,26 @@ def fit_mrc_files(
     output_avrot: Optional[str] = None,
     debug_output_dir: Optional[str] = None,
     timing_json: Optional[str] = None,
+    _estimator: Optional["TorchCtffindPowell"] = None,
+    _write_aggregate_outputs: bool = True,
+    _print_progress: bool = True,
+    _paths_are_expanded: bool = False,
+    _skip_header_validation: bool = False,
 ) -> list[CtfFitResult]:
     """Run the two-stage raw-image/preprocessed-spectrum GPU pipeline."""
     program_started = time.perf_counter()
     program_timings: dict[str, float] = {}
     stage_started = time.perf_counter()
-    paths = _expand_input_paths(input_paths)
+    paths = (
+        [str(Path(item).resolve()) for item in input_paths]
+        if _paths_are_expanded
+        else _expand_input_paths(input_paths)
+    )
     if config.timing:
         program_timings['input_path_expansion_s'] = float(
             time.perf_counter() - stage_started
         )
-    estimator = TorchCtffindPowell(config)
+    estimator = _estimator if _estimator is not None else TorchCtffindPowell(config)
     output_path = Path(output_star).resolve()
     ctf_dir = (
         Path(ctf_output_dir).resolve()
@@ -8667,7 +8696,11 @@ def fit_mrc_files(
         spectra_dir.mkdir(parents=True, exist_ok=True)
 
     stage_started = time.perf_counter()
-    total_images = sum(_count_mrc_micrographs(path) for path in paths)
+    total_images = (
+        len(paths)
+        if _skip_header_validation
+        else sum(_count_mrc_micrographs(path) for path in paths)
+    )
     if config.timing:
         program_timings['input_header_validation_s'] = float(
             time.perf_counter() - stage_started
@@ -8675,16 +8708,17 @@ def fit_mrc_files(
     results: list[CtfFitResult] = []
     processed = 0
     preprocessed = 0
-    print(f"Device: {estimator.device}")
-    print(f"Input files: {len(paths)}; independent micrographs: {total_images}")
-    print(
-        f"Preprocessing batch size: {config.preprocess_batch_size}; "
-        f"fitting batch size: {config.fit_batch_size}"
-    )
-    print(
-        f"Optimizer convergence check interval: "
-        f"{config.optimizer_check_interval} iterations"
-    )
+    if _print_progress:
+        print(f"Device: {estimator.device}")
+        print(f"Input files: {len(paths)}; independent micrographs: {total_images}")
+        print(
+            f"Preprocessing batch size: {config.preprocess_batch_size}; "
+            f"fitting batch size: {config.fit_batch_size}"
+        )
+        print(
+            f"Optimizer convergence check interval: "
+            f"{config.optimizer_check_interval} iterations"
+        )
 
     pending_records: list[_MicrographRecord] = []
     pending_chunks: list[torch.Tensor] = []
@@ -8926,38 +8960,40 @@ def fit_mrc_files(
                 f", thickness={result.ice_thickness_A / 10.0:.1f} nm"
                 if result.ice_thickness_fitted else ""
             )
-            print(
-                f"  [{processed}/{total_images}] {Path(result.source_file).name}: "
-                f"dfU={result.defocus1_A:.1f}, dfV={result.defocus2_A:.1f}, "
-                f"angle={result.astigmatism_angle_deg:.2f}, "
-                f"CC={result.score:.5f}, maxres={good}{tilt_text}{thickness_text}"
+            if _print_progress:
+                print(
+                    f"  [{processed}/{total_images}] {Path(result.source_file).name}: "
+                    f"dfU={result.defocus1_A:.1f}, dfV={result.defocus2_A:.1f}, "
+                    f"angle={result.astigmatism_angle_deg:.2f}, "
+                    f"CC={result.score:.5f}, maxres={good}{tilt_text}{thickness_text}"
+                )
+        if _write_aggregate_outputs:
+            checkpoint_started = time.perf_counter()
+            _write_relion_star(
+                output_path,
+                results,
+                config,
+                include_ctf_image=write_diagnostic_maps,
             )
-        checkpoint_started = time.perf_counter()
-        _write_relion_star(
-            output_path,
-            results,
-            config,
-            include_ctf_image=write_diagnostic_maps,
-        )
-        _write_extended_results_tsv(extended_tsv_path, results)
-        _write_ctffind_summary(ctffind_text_path, results, config, paths)
-        _write_avrot(avrot_path, results, config, paths)
-        if config.timing:
-            _add_timing(
-                program_timings,
-                'output_checkpoint_tables_write_s',
-                time.perf_counter() - checkpoint_started,
-            )
-            program_timings['program_total_wall_s'] = float(
-                time.perf_counter() - program_started
-            )
-            _write_timing_json(
-                timing_path, results,
-                program_timings=program_timings,
-                config=config,
-                resolved_device=estimator.device,
-                diagnostic_output=write_diagnostic_maps,
-            )
+            _write_extended_results_tsv(extended_tsv_path, results)
+            _write_ctffind_summary(ctffind_text_path, results, config, paths)
+            _write_avrot(avrot_path, results, config, paths)
+            if config.timing:
+                _add_timing(
+                    program_timings,
+                    'output_checkpoint_tables_write_s',
+                    time.perf_counter() - checkpoint_started,
+                )
+                program_timings['program_total_wall_s'] = float(
+                    time.perf_counter() - program_started
+                )
+                _write_timing_json(
+                    timing_path, results,
+                    program_timings=program_timings,
+                    config=config,
+                    resolved_device=estimator.device,
+                    diagnostic_output=write_diagnostic_maps,
+                )
 
     def fit_pending(number: int) -> None:
         nonlocal pending_records
@@ -9045,11 +9081,12 @@ def fit_mrc_files(
         first = preprocessed + 1
         last = preprocessed + len(raw_batch)
         shape = raw_batch[0].array.shape
-        print(
-            f"Preprocess [{first}-{last}/{total_images}] "
-            f"batch={len(raw_batch)}, shape={shape[1]}x{shape[0]}, "
-            f"pixel={raw_batch[0].pixel_size_A:.6g} A"
-        )
+        if _print_progress:
+            print(
+                f"Preprocess [{first}-{last}/{total_images}] "
+                f"batch={len(raw_batch)}, shape={shape[1]}x{shape[0]}, "
+                f"pixel={raw_batch[0].pixel_size_A:.6g} A"
+            )
         try:
             bundle = estimator.preprocess_bundle_batch(
                 [r.array for r in raw_batch],
@@ -9098,7 +9135,7 @@ def fit_mrc_files(
                     preprocessed += 1
 
     flush_all_pending()
-    if config.timing:
+    if _write_aggregate_outputs and config.timing:
         program_timings['program_total_wall_s'] = float(
             time.perf_counter() - program_started
         )
@@ -9109,19 +9146,791 @@ def fit_mrc_files(
             resolved_device=estimator.device,
             diagnostic_output=write_diagnostic_maps,
         )
-    print(f"Wrote {len(results)} rows to {_relion_path(output_path)}")
-    if write_diagnostic_maps:
-        print(f"Wrote one .ctf MRC per micrograph under {_relion_path(ctf_dir)}")
-    print(f"Wrote TSV results to {_relion_path(extended_tsv_path)}")
-    print(f"Wrote CTFFIND text to {_relion_path(ctffind_text_path)}")
-    print(f"Wrote avrot curves to {_relion_path(avrot_path)}")
-    if config.debug:
-        print(f"Wrote debug outputs under {_relion_path(debug_dir)}")
-    if config.timing:
-        print(f"Wrote timing JSON to {_relion_path(timing_path)}")
-    if config.fit_tilt and write_tilt_png and any(r.tilt_png_name for r in results):
-        print(f"Wrote tilt PNG diagnostics under {_relion_path(tilt_png_dir)}")
+    if _write_aggregate_outputs and _print_progress:
+        print(f"Wrote {len(results)} rows to {_relion_path(output_path)}")
+        if write_diagnostic_maps:
+            print(f"Wrote one .ctf MRC per micrograph under {_relion_path(ctf_dir)}")
+        print(f"Wrote TSV results to {_relion_path(extended_tsv_path)}")
+        print(f"Wrote CTFFIND text to {_relion_path(ctffind_text_path)}")
+        print(f"Wrote avrot curves to {_relion_path(avrot_path)}")
+        if config.debug:
+            print(f"Wrote debug outputs under {_relion_path(debug_dir)}")
+        if config.timing:
+            print(f"Wrote timing JSON to {_relion_path(timing_path)}")
+        if config.fit_tilt and write_tilt_png and any(r.tilt_png_name for r in results):
+            print(f"Wrote tilt PNG diagnostics under {_relion_path(tilt_png_dir)}")
     return results
+
+
+@dataclass(frozen=True)
+class _MultiDeviceRunOptions:
+    """Picklable output options shared by persistent device workers."""
+
+    output_star: str
+    ctf_output_dir: Optional[str]
+    save_filtered_spectra_dir: Optional[str]
+    write_diagnostic_maps: bool
+    tilt_png_output_dir: Optional[str]
+    write_tilt_png: bool
+    extended_results_tsv: Optional[str]
+    output_ctffind: Optional[str]
+    output_avrot: Optional[str]
+    debug_output_dir: Optional[str]
+    timing_json: Optional[str]
+
+
+@dataclass(frozen=True)
+class _AggregateOutputLayout:
+    output_path: Path
+    ctf_dir: Path
+    tilt_png_dir: Path
+    extended_tsv_path: Path
+    ctffind_text_path: Path
+    avrot_path: Path
+    debug_dir: Path
+    timing_path: Path
+    spectra_dir: Optional[Path]
+
+
+def _resolve_aggregate_output_layout(
+    output_star: str,
+    ctf_output_dir: Optional[str],
+    save_filtered_spectra_dir: Optional[str],
+    tilt_png_output_dir: Optional[str],
+    extended_results_tsv: Optional[str],
+    output_ctffind: Optional[str],
+    output_avrot: Optional[str],
+    debug_output_dir: Optional[str],
+    timing_json: Optional[str],
+) -> _AggregateOutputLayout:
+    output_path = Path(output_star).resolve()
+    ctf_dir = (
+        Path(ctf_output_dir).resolve()
+        if ctf_output_dir is not None
+        else output_path.parent
+    )
+    tilt_png_dir = (
+        Path(tilt_png_output_dir).resolve()
+        if tilt_png_output_dir is not None
+        else output_path.parent / "ctffind5_tilt_png"
+    )
+    extended_tsv_path = (
+        Path(extended_results_tsv).resolve()
+        if extended_results_tsv is not None
+        else output_path.with_name(output_path.stem + ".tsv")
+    )
+    ctffind_text_path = (
+        Path(output_ctffind).resolve()
+        if output_ctffind is not None
+        else output_path.with_name(output_path.stem + ".txt")
+    )
+    avrot_path = (
+        Path(output_avrot).resolve()
+        if output_avrot is not None
+        else output_path.with_name(output_path.stem + "_avrot.txt")
+    )
+    debug_dir = (
+        Path(debug_output_dir).resolve()
+        if debug_output_dir is not None
+        else output_path.parent / "ctffind5_debug"
+    )
+    timing_path = (
+        Path(timing_json).resolve()
+        if timing_json is not None
+        else output_path.with_name(output_path.stem + "_timing.json")
+    )
+    spectra_dir = (
+        Path(save_filtered_spectra_dir).resolve()
+        if save_filtered_spectra_dir is not None
+        else None
+    )
+    return _AggregateOutputLayout(
+        output_path=output_path,
+        ctf_dir=ctf_dir,
+        tilt_png_dir=tilt_png_dir,
+        extended_tsv_path=extended_tsv_path,
+        ctffind_text_path=ctffind_text_path,
+        avrot_path=avrot_path,
+        debug_dir=debug_dir,
+        timing_path=timing_path,
+        spectra_dir=spectra_dir,
+    )
+
+
+def _write_aggregate_outputs(
+    layout: _AggregateOutputLayout,
+    results: Sequence[CtfFitResult],
+    config: CtffindConfig,
+    input_paths: Sequence[str],
+    *,
+    include_ctf_image: bool,
+) -> None:
+    """Atomically write all aggregate tables in deterministic input order."""
+    _write_relion_star(
+        layout.output_path,
+        results,
+        config,
+        include_ctf_image=include_ctf_image,
+    )
+    _write_extended_results_tsv(layout.extended_tsv_path, results)
+    _write_ctffind_summary(layout.ctffind_text_path, results, config, input_paths)
+    _write_avrot(layout.avrot_path, results, config, input_paths)
+
+
+def _parse_gpu_ids(value: str) -> list[int]:
+    """Parse comma-separated GPU IDs, including compact ranges such as 0-3."""
+    ids: list[int] = []
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            pieces = token.split("-", 1)
+            if len(pieces) != 2:
+                raise ValueError(f"Invalid GPU range: {token}")
+            first, last = int(pieces[0]), int(pieces[1])
+            if first < 0 or last < first:
+                raise ValueError(f"Invalid GPU range: {token}")
+            ids.extend(range(first, last + 1))
+        else:
+            gpu_id = int(token)
+            if gpu_id < 0:
+                raise ValueError("GPU IDs must be non-negative")
+            ids.append(gpu_id)
+    if not ids:
+        raise ValueError("No GPU IDs were supplied")
+    if len(set(ids)) != len(ids):
+        raise ValueError("Duplicate GPU IDs are not allowed")
+    return ids
+
+
+def _parse_multi_device_specs(
+    devices_value: Optional[str],
+    gpu_ids_value: Optional[str],
+) -> Optional[list[str]]:
+    """Return normalized worker devices, or None for the original single process."""
+    if devices_value is None and gpu_ids_value is None:
+        return None
+    if devices_value is not None:
+        raw = [item.strip() for item in devices_value.split(",") if item.strip()]
+        if not raw:
+            raise ValueError("--devices requires at least one device")
+        normalized: list[str] = []
+        seen_cuda: set[str] = set()
+        for item in raw:
+            device = torch.device(item)
+            if device.type == "cuda":
+                index = 0 if device.index is None else int(device.index)
+                spec = f"cuda:{index}"
+                if spec in seen_cuda:
+                    raise ValueError(f"Duplicate CUDA worker device: {spec}")
+                seen_cuda.add(spec)
+                normalized.append(spec)
+            elif device.type == "cpu":
+                # Duplicate CPU workers are useful for scheduler regression tests.
+                normalized.append("cpu")
+            else:
+                raise ValueError(
+                    f"Multi-device workers currently support only CUDA or CPU, got {item!r}"
+                )
+    else:
+        assert gpu_ids_value is not None
+        if gpu_ids_value.strip().lower() == "all":
+            count = int(torch.cuda.device_count())
+            if count < 1:
+                raise RuntimeError("--gpu-ids all requested, but no CUDA devices are visible")
+            normalized = [f"cuda:{index}" for index in range(count)]
+        else:
+            normalized = [f"cuda:{index}" for index in _parse_gpu_ids(gpu_ids_value)]
+
+    cuda_specs = [spec for spec in normalized if spec.startswith("cuda:")]
+    if cuda_specs:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA worker devices were requested, but PyTorch CUDA is unavailable")
+        visible = int(torch.cuda.device_count())
+        for spec in cuda_specs:
+            index = int(spec.split(":", 1)[1])
+            if index >= visible:
+                raise ValueError(
+                    f"Requested {spec}, but only {visible} CUDA device(s) are visible. "
+                    "GPU IDs are logical IDs after CUDA_VISIBLE_DEVICES is applied."
+                )
+    return normalized
+
+
+def _validate_parallel_output_collisions(
+    paths: Sequence[str],
+    layout: _AggregateOutputLayout,
+    config: CtffindConfig,
+    *,
+    write_tilt_png: bool,
+) -> None:
+    """Reject duplicate basenames before workers can race on per-image files."""
+    generated: dict[Path, str] = {}
+    for source in paths:
+        stem = Path(source).stem
+        candidates: list[Path] = [layout.ctf_dir / f"{stem}.ctf"]
+        if config.fit_tilt and write_tilt_png:
+            candidates.append(layout.tilt_png_dir / f"{stem}_ctftilt.png")
+        if layout.spectra_dir is not None:
+            candidates.append(layout.spectra_dir / f"{stem}_filtered_spectrum.mrc")
+        if config.debug:
+            candidates.extend(
+                [
+                    layout.debug_dir / f"{stem}_debug.json",
+                    layout.debug_dir / f"{stem}_filtered_spectrum.mrc",
+                ]
+            )
+        for candidate in candidates:
+            resolved = candidate.resolve()
+            previous = generated.get(resolved)
+            if previous is not None and previous != source:
+                raise RuntimeError(
+                    f"Parallel output filename collision: {resolved} for both "
+                    f"{previous} and {source}. Rename duplicate micrograph basenames "
+                    "or run them with separate output directories."
+                )
+            generated[resolved] = source
+
+
+def _multi_device_worker_loop(
+    worker_index: int,
+    device_spec: str,
+    config: CtffindConfig,
+    options: _MultiDeviceRunOptions,
+    job_queue: Any,
+    result_queue: Any,
+    cpu_threads: int,
+) -> None:
+    """Persistent spawn worker: one fixed device and one micrograph at a time."""
+    try:
+        os.environ["OMP_NUM_THREADS"] = str(max(1, cpu_threads))
+        os.environ["MKL_NUM_THREADS"] = str(max(1, cpu_threads))
+        torch.set_num_threads(max(1, cpu_threads))
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            pass
+        device = torch.device(device_spec)
+        if device.type == "cuda":
+            torch.cuda.set_device(0 if device.index is None else device.index)
+        worker_config = replace(config, device=device_spec)
+        worker_config.validate()
+        estimator = TorchCtffindPowell(worker_config)
+        result_queue.put(
+            {
+                "kind": "ready",
+                "worker_index": worker_index,
+                "device": device_spec,
+                "device_name": (
+                    torch.cuda.get_device_name(estimator.device)
+                    if estimator.device.type == "cuda"
+                    else "CPU"
+                ),
+            }
+        )
+    except BaseException as exc:
+        result_queue.put(
+            {
+                "kind": "fatal",
+                "worker_index": worker_index,
+                "device": device_spec,
+                "error": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
+        return
+
+    while True:
+        job = job_queue.get()
+        if job is None:
+            break
+        job_index, source_file = job
+        job_started = time.perf_counter()
+        try:
+            fitted = fit_mrc_files(
+                [source_file],
+                worker_config,
+                output_star=options.output_star,
+                ctf_output_dir=options.ctf_output_dir,
+                save_filtered_spectra_dir=options.save_filtered_spectra_dir,
+                write_diagnostic_maps=options.write_diagnostic_maps,
+                continue_on_error=False,
+                tilt_png_output_dir=options.tilt_png_output_dir,
+                write_tilt_png=options.write_tilt_png,
+                extended_results_tsv=options.extended_results_tsv,
+                output_ctffind=options.output_ctffind,
+                output_avrot=options.output_avrot,
+                debug_output_dir=options.debug_output_dir,
+                timing_json=options.timing_json,
+                _estimator=estimator,
+                _write_aggregate_outputs=False,
+                _print_progress=False,
+                _paths_are_expanded=True,
+                _skip_header_validation=True,
+            )
+            if len(fitted) != 1:
+                raise RuntimeError(
+                    f"Worker expected one result for {source_file}, got {len(fitted)}"
+                )
+            result = fitted[0]
+            job_wall = float(time.perf_counter() - job_started)
+            if worker_config.timing:
+                timing_values = dict(result.timings or {})
+                timing_values["multi_gpu_job_wall_s"] = job_wall
+                result.timings = timing_values
+            result_queue.put(
+                {
+                    "kind": "result",
+                    "worker_index": worker_index,
+                    "device": device_spec,
+                    "job_index": int(job_index),
+                    "source_file": source_file,
+                    "job_wall_s": job_wall,
+                    "result": dict(result.__dict__),
+                }
+            )
+        except BaseException as exc:
+            if estimator.device.type == "cuda":
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
+            result_queue.put(
+                {
+                    "kind": "error",
+                    "worker_index": worker_index,
+                    "device": device_spec,
+                    "job_index": int(job_index),
+                    "source_file": source_file,
+                    "job_wall_s": float(time.perf_counter() - job_started),
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
+    result_queue.put(
+        {
+            "kind": "stopped",
+            "worker_index": worker_index,
+            "device": device_spec,
+        }
+    )
+
+
+def fit_mrc_files_multi_device(
+    input_paths: Sequence[str],
+    config: CtffindConfig,
+    devices: Sequence[str],
+    output_star: str,
+    ctf_output_dir: Optional[str] = None,
+    save_filtered_spectra_dir: Optional[str] = None,
+    write_diagnostic_maps: bool = True,
+    continue_on_error: bool = False,
+    tilt_png_output_dir: Optional[str] = None,
+    write_tilt_png: bool = True,
+    extended_results_tsv: Optional[str] = None,
+    output_ctffind: Optional[str] = None,
+    output_avrot: Optional[str] = None,
+    debug_output_dir: Optional[str] = None,
+    timing_json: Optional[str] = None,
+    worker_cpu_threads: int = 0,
+    checkpoint_every: int = 0,
+) -> list[CtfFitResult]:
+    """Run one persistent process per device, one independent micrograph per worker."""
+    program_started = time.perf_counter()
+    program_timings: dict[str, float] = {}
+    stage_started = time.perf_counter()
+    paths = _expand_input_paths(input_paths)
+    program_timings["input_path_expansion_s"] = float(
+        time.perf_counter() - stage_started
+    )
+    stage_started = time.perf_counter()
+    if not continue_on_error:
+        for path in paths:
+            _count_mrc_micrographs(path)
+    program_timings["input_header_validation_s"] = float(
+        time.perf_counter() - stage_started
+    )
+    if not devices:
+        raise ValueError("At least one multi-device worker is required")
+
+    layout = _resolve_aggregate_output_layout(
+        output_star,
+        ctf_output_dir,
+        save_filtered_spectra_dir,
+        tilt_png_output_dir,
+        extended_results_tsv,
+        output_ctffind,
+        output_avrot,
+        debug_output_dir,
+        timing_json,
+    )
+    layout.output_path.parent.mkdir(parents=True, exist_ok=True)
+    layout.ctf_dir.mkdir(parents=True, exist_ok=True)
+    if config.fit_tilt and write_tilt_png:
+        layout.tilt_png_dir.mkdir(parents=True, exist_ok=True)
+    if config.debug:
+        layout.debug_dir.mkdir(parents=True, exist_ok=True)
+    if layout.spectra_dir is not None:
+        layout.spectra_dir.mkdir(parents=True, exist_ok=True)
+    _validate_parallel_output_collisions(
+        paths, layout, config, write_tilt_png=write_tilt_png
+    )
+
+    worker_count = min(len(devices), len(paths))
+    worker_devices = list(devices[:worker_count])
+    if worker_cpu_threads < 0:
+        raise ValueError("--worker-cpu-threads must be >= 0")
+    if worker_cpu_threads == 0:
+        logical_cpus = max(1, int(os.cpu_count() or 1))
+        worker_cpu_threads = max(1, min(4, logical_cpus // worker_count))
+    if checkpoint_every < 0:
+        raise ValueError("--checkpoint-every must be >= 0")
+    effective_checkpoint_every = (
+        checkpoint_every if checkpoint_every > 0 else max(1, worker_count)
+    )
+
+    print(
+        f"Multi-device mode: {worker_count} persistent worker(s), "
+        "one micrograph per worker at a time"
+    )
+    print("Worker devices: " + ", ".join(worker_devices))
+    print(
+        f"Input files: {len(paths)}; worker CPU threads: {worker_cpu_threads}; "
+        f"checkpoint every {effective_checkpoint_every} completed micrograph(s)"
+    )
+
+    options = _MultiDeviceRunOptions(
+        output_star=str(layout.output_path),
+        ctf_output_dir=str(layout.ctf_dir),
+        save_filtered_spectra_dir=(
+            str(layout.spectra_dir) if layout.spectra_dir is not None else None
+        ),
+        write_diagnostic_maps=write_diagnostic_maps,
+        tilt_png_output_dir=str(layout.tilt_png_dir),
+        write_tilt_png=write_tilt_png,
+        extended_results_tsv=str(layout.extended_tsv_path),
+        output_ctffind=str(layout.ctffind_text_path),
+        output_avrot=str(layout.avrot_path),
+        debug_output_dir=str(layout.debug_dir),
+        timing_json=str(layout.timing_path),
+    )
+
+    context = mp.get_context("spawn")
+    job_queue = context.Queue()
+    result_queue = context.Queue()
+    workers: list[mp.Process] = []
+    scheduler_started = time.perf_counter()
+    for worker_index, device_spec in enumerate(worker_devices):
+        process = context.Process(
+            target=_multi_device_worker_loop,
+            args=(
+                worker_index,
+                device_spec,
+                config,
+                options,
+                job_queue,
+                result_queue,
+                worker_cpu_threads,
+            ),
+            name=f"ctffind5-{device_spec.replace(':', '-')}",
+        )
+        process.start()
+        workers.append(process)
+
+    for job_index, source_file in enumerate(paths):
+        job_queue.put((job_index, source_file))
+    for _ in workers:
+        job_queue.put(None)
+    program_timings["multi_gpu_scheduler_startup_and_enqueue_s"] = float(
+        time.perf_counter() - scheduler_started
+    )
+
+    completed: dict[int, CtfFitResult] = {}
+    assignments: list[dict[str, object]] = []
+    errors: list[dict[str, object]] = []
+    ready_workers: dict[int, dict[str, object]] = {}
+    terminal_jobs = 0
+    last_checkpoint_count = 0
+    checkpoint_total = 0.0
+
+    def ordered_results() -> list[CtfFitResult]:
+        return [completed[index] for index in sorted(completed)]
+
+    def scheduler_summary() -> dict[str, object]:
+        per_device: dict[str, dict[str, object]] = {}
+        per_worker: dict[str, dict[str, object]] = {}
+        for assignment in assignments:
+            device_spec = str(assignment["device"])
+            worker_key = str(int(assignment["worker_index"]))
+            entry = per_device.setdefault(
+                device_spec,
+                {"completed_micrographs": 0, "busy_wall_s": 0.0},
+            )
+            worker_entry = per_worker.setdefault(
+                worker_key,
+                {
+                    "worker_index": int(assignment["worker_index"]),
+                    "device": device_spec,
+                    "completed_micrographs": 0,
+                    "busy_wall_s": 0.0,
+                },
+            )
+            for target in (entry, worker_entry):
+                target["completed_micrographs"] = int(target["completed_micrographs"]) + 1
+                target["busy_wall_s"] = float(target["busy_wall_s"]) + float(
+                    assignment["job_wall_s"]
+                )
+        for collection in (per_device, per_worker):
+            for entry in collection.values():
+                count = int(entry["completed_micrographs"])
+                entry["mean_job_wall_s"] = (
+                    float(entry["busy_wall_s"]) / count if count else 0.0
+                )
+        return {
+            "mode": "one_micrograph_per_device_worker",
+            "worker_count": worker_count,
+            "devices": worker_devices,
+            "worker_cpu_threads": worker_cpu_threads,
+            "checkpoint_every": effective_checkpoint_every,
+            "ready_workers": [ready_workers[k] for k in sorted(ready_workers)],
+            "per_device": per_device,
+            "per_worker": per_worker,
+            "assignments": sorted(assignments, key=lambda item: int(item["job_index"])),
+            "errors": errors,
+        }
+
+    def write_checkpoint(force: bool = False) -> None:
+        nonlocal last_checkpoint_count, checkpoint_total
+        current = len(completed)
+        if not force and current - last_checkpoint_count < effective_checkpoint_every:
+            return
+        results_now = ordered_results()
+        checkpoint_started = time.perf_counter()
+        _write_aggregate_outputs(
+            layout,
+            results_now,
+            config,
+            paths,
+            include_ctf_image=write_diagnostic_maps,
+        )
+        checkpoint_total += time.perf_counter() - checkpoint_started
+        last_checkpoint_count = current
+        if config.timing:
+            timing_values = dict(program_timings)
+            timing_values["output_checkpoint_tables_write_s"] = float(checkpoint_total)
+            timing_values["program_total_wall_s"] = float(
+                time.perf_counter() - program_started
+            )
+            _write_timing_json(
+                layout.timing_path,
+                results_now,
+                program_timings=timing_values,
+                config=config,
+                resolved_device=None,
+                diagnostic_output=write_diagnostic_maps,
+                runtime_settings_extra={
+                    "multi_gpu": True,
+                    "requested_device": "multi-device",
+                    "resolved_device": worker_devices,
+                    "worker_devices": worker_devices,
+                    "worker_count": worker_count,
+                    "worker_cpu_threads": worker_cpu_threads,
+                    "micrographs_per_worker_at_a_time": 1,
+                    "multi_gpu_timing_note": (
+                        "Per-stage totals sum work across concurrent workers and may "
+                        "exceed elapsed program wall time."
+                    ),
+                },
+                extra_payload={"multi_gpu_scheduler": scheduler_summary()},
+            )
+
+    try:
+        while terminal_jobs < len(paths):
+            try:
+                message = result_queue.get(timeout=0.5)
+            except queue.Empty:
+                if not any(process.is_alive() for process in workers):
+                    missing = len(paths) - terminal_jobs
+                    raise RuntimeError(
+                        f"All multi-device workers exited with {missing} job(s) unreported"
+                    )
+                continue
+
+            kind = str(message.get("kind", ""))
+            if kind == "ready":
+                ready_workers[int(message["worker_index"])] = {
+                    "worker_index": int(message["worker_index"]),
+                    "device": str(message["device"]),
+                    "device_name": str(message.get("device_name", "")),
+                }
+                continue
+            if kind == "stopped":
+                continue
+            if kind == "fatal":
+                error_entry = {
+                    "worker_index": int(message.get("worker_index", -1)),
+                    "device": str(message.get("device", "")),
+                    "source_file": None,
+                    "error": str(message.get("error", "worker initialization failed")),
+                }
+                errors.append(error_entry)
+                print(
+                    f"ERROR: worker {error_entry['worker_index']} on "
+                    f"{error_entry['device']} failed to initialize: {error_entry['error']}",
+                    file=sys.stderr,
+                )
+                if not continue_on_error:
+                    raise RuntimeError(str(error_entry["error"]))
+                continue
+            if kind not in {"result", "error"}:
+                raise RuntimeError(f"Unknown multi-device worker message: {message!r}")
+
+            terminal_jobs += 1
+            job_index = int(message["job_index"])
+            source_file = str(message["source_file"])
+            worker_index = int(message["worker_index"])
+            device_spec = str(message["device"])
+            job_wall = float(message.get("job_wall_s", 0.0))
+            if kind == "error":
+                error_entry = {
+                    "job_index": job_index,
+                    "worker_index": worker_index,
+                    "device": device_spec,
+                    "source_file": source_file,
+                    "error": str(message.get("error", "unknown worker error")),
+                }
+                errors.append(error_entry)
+                print(
+                    f"ERROR: [{terminal_jobs}/{len(paths)}] {Path(source_file).name} "
+                    f"on {device_spec}: {error_entry['error']}",
+                    file=sys.stderr,
+                )
+                if not continue_on_error:
+                    detail = str(message.get("traceback", ""))
+                    raise RuntimeError(
+                        f"{source_file} failed on {device_spec}: {error_entry['error']}\n{detail}"
+                    )
+                write_checkpoint()
+                continue
+
+            result = CtfFitResult(**dict(message["result"]))
+            completed[job_index] = result
+            assignments.append(
+                {
+                    "job_index": job_index,
+                    "micrograph": result.micrograph_name,
+                    "source_file": source_file,
+                    "worker_index": worker_index,
+                    "device": device_spec,
+                    "job_wall_s": job_wall,
+                }
+            )
+            good = (
+                f"{result.thon_rings_good_fit_resolution_A:.2f} A"
+                if result.thon_rings_good_fit_resolution_A > 0.0
+                else "undetermined"
+            )
+            tilt_text = (
+                f", tilt={result.tilt_angle_deg:.2f} deg, axis={result.tilt_axis_deg:.2f} deg"
+                if result.tilt_fitted else ""
+            )
+            thickness_text = (
+                f", thickness={result.ice_thickness_A / 10.0:.1f} nm"
+                if result.ice_thickness_fitted else ""
+            )
+            print(
+                f"  [{terminal_jobs}/{len(paths)}] {Path(source_file).name} "
+                f"on {device_spec}: dfU={result.defocus1_A:.1f}, "
+                f"dfV={result.defocus2_A:.1f}, angle={result.astigmatism_angle_deg:.2f}, "
+                f"CC={result.score:.5f}, maxres={good}{tilt_text}{thickness_text}, "
+                f"wall={job_wall:.3f}s"
+            )
+            write_checkpoint()
+    except BaseException:
+        for process in workers:
+            if process.is_alive():
+                process.terminate()
+        for process in workers:
+            process.join(timeout=5.0)
+        if completed:
+            write_checkpoint(force=True)
+        try:
+            job_queue.close()
+            result_queue.close()
+        except Exception:
+            pass
+        raise
+
+    for process in workers:
+        process.join(timeout=30.0)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5.0)
+        if process.exitcode not in (0, None):
+            warnings.warn(
+                f"Worker {process.name} exited with code {process.exitcode}",
+                RuntimeWarning,
+            )
+
+    try:
+        job_queue.close()
+        result_queue.close()
+    except Exception:
+        pass
+    program_timings["multi_gpu_compute_and_collect_s"] = float(
+        time.perf_counter() - scheduler_started
+    )
+    if len(completed) != last_checkpoint_count or not layout.output_path.exists():
+        write_checkpoint(force=True)
+    program_timings["output_checkpoint_tables_write_s"] = float(checkpoint_total)
+    program_timings["program_total_wall_s"] = float(
+        time.perf_counter() - program_started
+    )
+    final_results = ordered_results()
+    if config.timing:
+        _write_timing_json(
+            layout.timing_path,
+            final_results,
+            program_timings=program_timings,
+            config=config,
+            resolved_device=None,
+            diagnostic_output=write_diagnostic_maps,
+            runtime_settings_extra={
+                "multi_gpu": True,
+                "requested_device": "multi-device",
+                "resolved_device": worker_devices,
+                "worker_devices": worker_devices,
+                "worker_count": worker_count,
+                "worker_cpu_threads": worker_cpu_threads,
+                "micrographs_per_worker_at_a_time": 1,
+                "multi_gpu_timing_note": (
+                    "Per-stage totals sum work across concurrent workers and may "
+                    "exceed elapsed program wall time."
+                ),
+            },
+            extra_payload={"multi_gpu_scheduler": scheduler_summary()},
+        )
+
+    print(f"Wrote {len(final_results)} rows to {_relion_path(layout.output_path)}")
+    if write_diagnostic_maps:
+        print(f"Wrote one .ctf MRC per micrograph under {_relion_path(layout.ctf_dir)}")
+    print(f"Wrote TSV results to {_relion_path(layout.extended_tsv_path)}")
+    print(f"Wrote CTFFIND text to {_relion_path(layout.ctffind_text_path)}")
+    print(f"Wrote avrot curves to {_relion_path(layout.avrot_path)}")
+    if config.debug:
+        print(f"Wrote debug outputs under {_relion_path(layout.debug_dir)}")
+    if config.timing:
+        print(f"Wrote timing JSON to {_relion_path(layout.timing_path)}")
+    if config.fit_tilt and write_tilt_png and any(r.tilt_png_name for r in final_results):
+        print(f"Wrote tilt PNG diagnostics under {_relion_path(layout.tilt_png_dir)}")
+    if errors:
+        print(
+            f"Completed with {len(errors)} failed micrograph(s); "
+            f"{len(final_results)} result(s) were written.",
+            file=sys.stderr,
+        )
+    return final_results
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -9173,11 +9982,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--angle-step", type=float, default=5.0)
     parser.add_argument("--rotation-batch-size", type=int, default=8)
     parser.add_argument(
-        "--preprocess-batch-size", type=int, default=16,
+        "--preprocess-batch-size", type=int, default=4,
         help="Raw micrographs processed together during FFT/preprocessing",
     )
     parser.add_argument(
-        "--fit-batch-size", type=int, default=128,
+        "--fit-batch-size", type=int, default=64,
         help=(
             "Filtered spectra fitted together on the GPU. Very large batches "
             "can be slower when optimizer convergence varies between images."
@@ -9199,7 +10008,44 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--powell-maxiter-2d", type=int, default=30)
     parser.add_argument("--powell-line-maxiter", type=int, default=80)
     parser.add_argument("--no-powell-bounds", action="store_true")
-    parser.add_argument("--device", default="auto")
+    device_group = parser.add_mutually_exclusive_group()
+    device_group.add_argument(
+        "--device", default="auto",
+        help=(
+            "Single-process PyTorch device: auto, cpu, cuda, or cuda:N. "
+            "For one persistent worker per GPU, use --gpu-ids or --devices."
+        ),
+    )
+    device_group.add_argument(
+        "--devices", default=None, metavar="DEVICE,DEVICE,...",
+        help=(
+            "Enable the internal multi-device scheduler, for example "
+            "--devices cuda:0,cuda:1,cuda:2,cuda:3. Each persistent worker "
+            "uses one fixed device and processes one micrograph at a time."
+        ),
+    )
+    device_group.add_argument(
+        "--gpu-ids", default=None, metavar="IDS",
+        help=(
+            "CUDA shorthand for multi-GPU mode, for example --gpu-ids 0,1,2,3, "
+            "--gpu-ids 0-3, or --gpu-ids all. IDs are logical after "
+            "CUDA_VISIBLE_DEVICES is applied."
+        ),
+    )
+    parser.add_argument(
+        "--worker-cpu-threads", type=int, default=0,
+        help=(
+            "CPU threads assigned to each multi-device worker; 0 chooses an "
+            "automatic value capped at 4."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-every", type=int, default=0, metavar="N",
+        help=(
+            "In multi-device mode, rewrite aggregate STAR/TSV/avrot files after "
+            "every N completed micrographs; 0 uses one scheduler wave."
+        ),
+    )
     parser.add_argument(
         "--save-filtered-spectra", default=None, metavar="DIRECTORY"
     )
@@ -9474,8 +10320,18 @@ def _run_self_test(device_spec: str = "cpu") -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
+    multi_devices = _parse_multi_device_specs(args.devices, args.gpu_ids)
+    if multi_devices is None and ("," in args.device or args.device.count(":") > 1):
+        parser.error(
+            "--device accepts only one PyTorch device such as cuda:0. "
+            "Use --gpu-ids 0,1 or --devices cuda:0,cuda:1 for multiple GPUs."
+        )
     if args.self_test:
-        _run_self_test(args.device)
+        if multi_devices is None:
+            _run_self_test(args.device)
+        else:
+            for device_spec in multi_devices:
+                _run_self_test(device_spec)
         return 0
     if not args.inputs:
         parser.error("at least one 2-D MRC input or glob is required")
@@ -9547,9 +10403,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         timing=args.timing,
     )
     config.validate()
-    fit_mrc_files(
-        args.inputs,
-        config,
+    common_arguments = dict(
         output_star=args.output,
         ctf_output_dir=args.ctf_dir,
         save_filtered_spectra_dir=args.save_filtered_spectra,
@@ -9563,6 +10417,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         debug_output_dir=args.debug_dir,
         timing_json=args.timing_json,
     )
+    if multi_devices is None:
+        fit_mrc_files(args.inputs, config, **common_arguments)
+    else:
+        fit_mrc_files_multi_device(
+            args.inputs,
+            config,
+            multi_devices,
+            worker_cpu_threads=args.worker_cpu_threads,
+            checkpoint_every=args.checkpoint_every,
+            **common_arguments,
+        )
     return 0
 
 
