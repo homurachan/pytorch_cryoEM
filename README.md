@@ -50,7 +50,7 @@ The pytorch-ctffind is roughly the same speed as [GCTF](https://www.sciencedirec
 
 The pytorch-unbend excludes less patches than the old version. But the final results don't have much differences.
 
-The pytorch-ctftilt is not stable as the original version. To be fixed soon.
+The pytorch-ctftilt is not stable as the original version. Don't use --fit-tilt for ctffind_ctftilt_pytorch.py.
 
 # Usage
 
