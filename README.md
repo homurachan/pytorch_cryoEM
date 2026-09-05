@@ -31,7 +31,7 @@ Upload the multi-GPU supported unbend_pytorch_v2.py.
 
 Example usage:
 
-`python unbend_pytorch_v2_multi_gpu.py "*.tif" corr_folder --pixel-size $pixel_size --output-binning 2 --gpu-ids 0,1,2,3,4,5,6,7 --exposure-per-frame $dose_per_frame  --voltage 300 --gain gain.mrc`
+`python unbend_pytorch_v2.py "*.tif" corr_folder --pixel-size $pixel_size --output-binning 2 --gpu-ids 0,1,2,3,4,5,6,7 --exposure-per-frame $dose_per_frame  --voltage 300 --gain gain.mrc`
 
 A folder named corr_folder will be created, and the corrected micrographs and corresponding png files will be stored there.
 
