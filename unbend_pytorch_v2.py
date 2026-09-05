@@ -199,14 +199,20 @@ def edge_mean(image: Tensor) -> Tensor:
 
 
 def replace_outliers_with_local_mean(image: Tensor, sigma_threshold: float = 12.0) -> Tensor:
-    """Approximate cisTEM ReplaceOutliersWithMean(12)."""
+    """cisTEM ReplaceOutliersWithMean: replace by the ORIGINAL whole-frame mean.
+
+    The historical function name is retained so all callers remain unchanged.
+    Mean and population sigma include every pixel before any replacement; this
+    is a single pass, not a 3x3 average, a masked mean, or iterative clipping.
+    """
     mean = image.mean()
-    sigma = image.std(unbiased=False).clamp_min(1.0e-6)
-    bad = torch.abs(image - mean) > sigma_threshold * sigma
+    sigma = image.std(unbiased=False)
+    upper = mean + sigma_threshold * sigma
+    lower = mean - sigma_threshold * sigma
+    bad = (image > upper) | (image < lower)
     if not bool(bad.any()):
         return image
-    local = F.avg_pool2d(image[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
-    return torch.where(bad, local, image)
+    return torch.where(bad, mean, image)
 
 
 def make_magnification_grid(
@@ -976,28 +982,76 @@ def estimate_correlation_shifts(
     px = flat_index % width
     batch = torch.arange(n, device=targets.device)
 
-    left = correlation[batch, py, (px - 1) % width]
     center = correlation[batch, py, px]
-    right = correlation[batch, py, (px + 1) % width]
-    up = correlation[batch, (py - 1) % height, px]
-    down = correlation[batch, (py + 1) % height, px]
 
-    denom_x = left - 2.0 * center + right
-    denom_y = up - 2.0 * center + down
-    sub_x = torch.where(
-        torch.abs(denom_x) > 1.0e-12,
-        0.5 * (left - right) / denom_x,
-        torch.zeros_like(center),
-    ).clamp(-1.0, 1.0)
-    sub_y = torch.where(
-        torch.abs(denom_y) > 1.0e-12,
-        0.5 * (up - down) / denom_y,
-        torch.zeros_like(center),
-    ).clamp(-1.0, 1.0)
+    # Image::FindPeakWithParabolaFit samples a CENTERED correlation image.
+    # Our correlation stays in native FFT order. Map only the 3x3 neighborhood
+    # to centered physical coordinates, then map valid samples back. In
+    # particular, native FFT index 0 is NOT a physical image edge: its left/up
+    # neighbors are legitimate. Only the edges of the centered CC image are
+    # zero-padded. No movie/reference image is flipped, rotated, or resampled.
+    offsets = torch.arange(-1, 2, dtype=torch.long, device=correlation.device)
+    centered_x = (px + width // 2) % width
+    centered_y = (py + height // 2) % height
+    sample_x = centered_x[:, None] + offsets[None, :]
+    sample_y = centered_y[:, None] + offsets[None, :]
+    valid = (
+        (sample_y[:, :, None] >= 0) & (sample_y[:, :, None] < height)
+        & (sample_x[:, None, :] >= 0) & (sample_x[:, None, :] < width)
+    )
+    raw_x = (sample_x - width // 2) % width
+    raw_y = (sample_y - height // 2) % height
+    square_yx = correlation[batch[:, None, None], raw_y[:, :, None], raw_x[:, None, :]]
+    square_yx = torch.where(valid, square_yx, torch.zeros_like(square_yx))
+    # Only nine values per frame are promoted, not the full correlation map.
+    # C++ indexes scaled_square[x][y], while image arrays are indexed [y,x].
+    square = square_yx.to(torch.float64).transpose(1, 2)
+    average_of_square = square.mean(dim=(1, 2))
+    scale_denominator = torch.where(
+        average_of_square != 0.0, average_of_square, torch.ones_like(average_of_square)
+    )
+    square = square / scale_denominator[:, None, None]
+    s00, s01, s02 = square[:, 0, 0], square[:, 0, 1], square[:, 0, 2]
+    s10, s11, s12 = square[:, 1, 0], square[:, 1, 1], square[:, 1, 2]
+    s20, s21, s22 = square[:, 2, 0], square[:, 2, 1], square[:, 2, 2]
+
+    # Transcription of the original six-coefficient, nine-point formula.
+    # Do not replace this with two independent 1-D parabolas or a generic fit.
+    c1 = (26.0*s00 - s01 + 2.0*s02 - s10 - 19.0*s11 - 7.0*s12
+          + 2.0*s20 - 7.0*s21 + 14.0*s22) / 9.0
+    c2 = (8.0*s00 - 8.0*s01 + 5.0*s10 - 8.0*s11 + 3.0*s12
+          + 2.0*s20 - 8.0*s21 + 6.0*s22) / -6.0
+    c3 = (s00 - 2.0*s01 + s02 + s10 - 2.0*s11 + s12
+          + s20 - 2.0*s21 + s22) / 6.0
+    c4 = (8.0*s00 + 5.0*s01 + 2.0*s02 - 8.0*s10 - 8.0*s11
+          - 8.0*s12 + 3.0*s21 + 6.0*s22) / -6.0
+    c5 = (s00 - s02 - s20 + s22) / 4.0
+    c6 = (s00 + s01 + s02 - 2.0*s10 - 2.0*s11 - 2.0*s12
+          + s20 + s21 + s22) / 6.0
+    denominator = 4.0*c3*c6 - c5.square()
+    degenerate = denominator == 0.0
+    safe_denominator = torch.where(degenerate, torch.ones_like(denominator), denominator)
+    sub_y = (c4*c5 - 2.0*c2*c6) / safe_denominator - 2.0
+    sub_x = (c2*c5 - 2.0*c4*c3) / safe_denominator - 2.0
+    # C++ resets only the offending axis to zero; it does NOT clamp to +/-1.
+    sub_x = torch.where(degenerate | (sub_x > 1.05) | (sub_x < -1.05), 0.0, sub_x)
+    sub_y = torch.where(degenerate | (sub_y > 1.05) | (sub_y < -1.05), 0.0, sub_y)
+    sub_x = sub_x.to(torch.float32)
+    sub_y = sub_y.to(torch.float32)
+
+    # Match the original fitted peak value and its 15% fallback as well.
+    # The alignment callers use only x/y, but the three-result API is retained.
+    peak_value = (4.0*c1*c3*c6 - c1*c5.square() - c2.square()*c6
+                  + c2*c4*c5 - c4.square()*c3)
+    peak_value = peak_value * average_of_square / safe_denominator
+    center64 = center.to(torch.float64)
+    value_discrepancy = torch.abs((peak_value - center64) / (peak_value + center64))
+    peak_value = torch.where(degenerate | (value_discrepancy > 0.15), center64, peak_value)
+    peak_value = peak_value.to(center.dtype)
 
     signed_x = torch.where(px <= width // 2, px, px - width).to(torch.float32)
     signed_y = torch.where(py <= height // 2, py, py - height).to(torch.float32)
-    return signed_x + sub_x, signed_y + sub_y, center
+    return signed_x + sub_x, signed_y + sub_y, peak_value
 
 def running_window_bounds(n: int, index: int, window: int) -> Tuple[int, int]:
     if window <= 1:
@@ -1067,36 +1121,59 @@ def polynomial_smooth(values: Tensor, degree: int = 4) -> Tensor:
 
 
 def savitzky_golay_linear(values: Tensor, window: int) -> Tensor:
-    """Local degree-1 least-squares smoother with edge-aware windows."""
+    """Degree-1 SG with Curve::FitSavitzkyGolayToData's ordered end fits."""
     n = values.numel()
     if window >= n or n < 3:
         return values.clone()
     window = odd_at_least(window, 3)
+    if window >= n:
+        return values.clone()
     half = window // 2
     out = torch.empty_like(values)
     indices = torch.arange(n, dtype=torch.float64, device=values.device)
     y64 = values.to(torch.float64)
-    for i in range(n):
-        start = max(0, i - half)
-        end = min(n, i + half + 1)
-        if end - start < window:
-            if start == 0:
-                end = min(n, window)
-            else:
-                start = max(0, n - window)
+
+    # Fit every complete interior window before either endpoint is touched.
+    for i in range(half, n - half):
+        start = i - half
+        end = i + half + 1
         x = indices[start:end] - float(i)
         design = torch.stack((torch.ones_like(x), x), dim=1)
         coeff = torch.linalg.lstsq(design, y64[start:end, None]).solution[:, 0]
         out[i] = coeff[0].to(values.dtype)
+
+    # Left end: original values outside the fitted interior, already-smoothed
+    # values inside it. The right-end condition matters for short curves.
+    left_y = y64[:window].clone()
+    interior_end = min(window, n - half)
+    left_y[half:interior_end] = out[half:interior_end].to(torch.float64)
+    x = indices[:window] - float(half)
+    design = torch.stack((torch.ones_like(x), x), dim=1)
+    coeff = torch.linalg.lstsq(design, left_y[:, None]).solution[:, 0]
+    out[:half] = (design[:half] @ coeff).to(values.dtype)
+
+    # Right end: local indices 0..half use the current fitted curve; the last
+    # half-window uses raw values. For overlapping end windows, this includes
+    # the left end just fitted above, exactly in the original call order.
+    end_start = n - window
+    right_y = y64[end_start:].clone()
+    right_y[: half + 1] = out[end_start : n - half].to(torch.float64)
+    x = indices[end_start:] - float(end_start + half)
+    design = torch.stack((torch.ones_like(x), x), dim=1)
+    coeff = torch.linalg.lstsq(design, right_y[:, None]).solution[:, 0]
+    out[n - half :] = (design[half + 1 :] @ coeff).to(values.dtype)
     return out
 
 
 def robust_outlier_mask(x: Tensor, y: Tensor, smooth_x: Tensor, smooth_y: Tensor) -> Tensor:
+    """Original upper-IQR frame test; smooth_x/y are smoothed INCREMENTS.
+
+    SearchOutlierIndices subtracts these increments from cumulative+current
+    shifts, not from the current increments alone. Preserve that historical
+    residual definition rather than substituting a conventional residual.
+    """
     residual = torch.sqrt((x - smooth_x).square() + (y - smooth_y).square())
-    median = residual.median()
-    mad = torch.abs(residual - median).median().clamp_min(1.0e-6)
-    robust_sigma = 1.4826 * mad
-    return residual > median + 4.5 * robust_sigma
+    return _upper_iqr_outliers(residual)
 
 
 @dataclass
@@ -1187,28 +1264,46 @@ def iterative_align(
             smooth_y = savitzky_golay_linear(absolute_y, options.savitzky_golay_window)
             current_x = smooth_x - total_x
             current_y = smooth_y - total_y
-        elif n >= 5:
-            smooth_x = savitzky_golay_linear(absolute_x, min(5, odd_at_least(n - 1 if n % 2 == 0 else n)))
-            smooth_y = savitzky_golay_linear(absolute_y, min(5, odd_at_least(n - 1 if n % 2 == 0 else n)))
+        else:
+            # Smooth_Shifts stores S(total + current) - total. Use the configured
+            # window (not a hard-coded 5) and preserve SearchOutlierIndices'
+            # cumulative-minus-smoothed-increment residual convention.
+            smooth_x = savitzky_golay_linear(absolute_x, options.savitzky_golay_window) - total_x
+            smooth_y = savitzky_golay_linear(absolute_y, options.savitzky_golay_window) - total_y
             outliers = robust_outlier_mask(absolute_x, absolute_y, smooth_x, smooth_y)
             if bool(outliers.any()):
-                idx = torch.nonzero(outliers, as_tuple=False)[:, 0]
                 reference_sum = stack.sum(dim=0, keepdim=True)
-                target_chunk = running_sum_indices(stack, options.running_average, idx)
-                ref_chunk = reference_sum - target_chunk
-                rx, ry, _ = estimate_correlation_shifts(
-                    ref_chunk,
-                    target_chunk,
-                    options.unitless_bfactor * 2.0,
-                    options.inner_radius,
-                    options.outer_radius,
-                    options.mask_central_cross,
-                    options.vertical_mask_size,
-                    options.horizontal_mask_size,
-                )
-                current_x[idx] = rx
-                current_y[idx] = ry
-                del reference_sum, target_chunk, ref_chunk, rx, ry
+                idx = torch.nonzero(outliers, as_tuple=False)[:, 0]
+                # B -> 2B: re-estimate only the first outlier set, without
+                # applying shifts or changing the reference stack in between.
+                for start in range(0, idx.numel(), batch_size):
+                    target_idx = idx[start : start + batch_size]
+                    rx, ry = _estimate_alignment_shifts_for_indices(
+                        stack, reference_sum, target_idx, options,
+                        unitless_bfactor=options.unitless_bfactor * 2.0,
+                    )
+                    current_x[target_idx] = rx
+                    current_y[target_idx] = ry
+                    del rx, ry
+
+                absolute_x = total_x + current_x
+                absolute_y = total_y + current_y
+                smooth_x = savitzky_golay_linear(absolute_x, options.savitzky_golay_window) - total_x
+                smooth_y = savitzky_golay_linear(absolute_y, options.savitzky_golay_window) - total_y
+                new_outliers = robust_outlier_mask(absolute_x, absolute_y, smooth_x, smooth_y)
+                idx = torch.nonzero(outliers & new_outliers, as_tuple=False)[:, 0]
+                # Restore the original B only for the intersection, not for
+                # newly flagged frames. No third smoothing/update is applied.
+                for start in range(0, idx.numel(), batch_size):
+                    target_idx = idx[start : start + batch_size]
+                    rx, ry = _estimate_alignment_shifts_for_indices(
+                        stack, reference_sum, target_idx, options,
+                        unitless_bfactor=options.unitless_bfactor,
+                    )
+                    current_x[target_idx] = rx
+                    current_y[target_idx] = ry
+                    del rx, ry
+                del reference_sum
 
         current_x = current_x - current_x[middle]
         current_y = current_y - current_y[middle]
@@ -1448,7 +1543,7 @@ def align_patches(
         vertical_mask_size=vertical_mask_size,
         horizontal_mask_size=horizontal_mask_size,
         verbose=False,
-        batch_size=batch_size,
+        batch_size=96,
     )
 
     for p, (cx, cy) in enumerate(centers):
@@ -1457,7 +1552,7 @@ def align_patches(
         _, sx, sy = iterative_align(patch, options)
         all_x[:, p] = sx
         all_y[:, p] = sy
-        if (p + 1) % max(1, min(8, n_patches)) == 0 or p + 1 == n_patches:
+        if (p + 1) % max(1, min(24, n_patches)) == 0 or p + 1 == n_patches:
             log(f"  aligned patches {p + 1}/{n_patches}")
     return all_x, all_y
 
