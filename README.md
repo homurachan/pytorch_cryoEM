@@ -1,6 +1,6 @@
 # pytorch_cryoEM
 
-pytorch implementation (by ChatGPT 5.5 and 5.6) of many cryo-EM softwares. Right now all softwares come from the Grigorieff Lab.
+pytorch implementation (by ChatGPT 5.5, 5.6, and 6) of many cryo-EM softwares. Right now all softwares come from the Grigorieff Lab.
 
 ## Required libraries
 
@@ -17,6 +17,16 @@ For unbend_pytorch_v2, nvidia-nvimgcodec-cu12[nvtiff], and nvidia-nvjpeg2k-cu12 
 3. The pytorch-implementation of [ctffind 5](https://elifesciences.org/reviewed-preprints/97227v2)
 
 4. The pytorch-implementation of cisTEM-simulate is here: https://github.com/homurachan/cisTEM_simulate_pytorch
+
+## Update 20260915
+
+Upload resmap_pytorch_py310_complete_2.0.0.zip . This one is the pytorch version of [resmap](https://resmap.sourceforge.net/) and [monores](https://www.sciencedirect.com/science/article/pii/S0969212617304434).
+
+Upload blocfilt_resmap_pytorch.py . This program is the pytorch version of blocfilt from [bsoft](https://cbiit.github.io/Bsoft), which reads the output of resmap/monores and does localized filtering.
+
+Upload v2lite.py . This is a simple version of [EMAN](https://www.sciencedirect.com/science/article/pii/S1047847799941746?via%3Dihub) package v2. It requires python3-tk to be installed.
+
+Upload show_star_particles.py . This is a simple version of relion_display. It reads coordinates from relion star file or 2dtm tsv files, and draw green circles accordingly.
 
 ## Update 20260826
 
