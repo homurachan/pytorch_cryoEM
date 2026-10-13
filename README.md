@@ -33,6 +33,8 @@ Usage: `python ctffind_ctftilt_pytorch.py --input_star corrected_micrographs.sta
 
 Remove `--no-diagnostic-output` if you want the .ctf output. Reduce `--preprocess-batch-size` and `--fit-batch-size` if it runs out of memory.
 
+Upload the [ctffind4_pytorch_no_cudnn.py](https://github.com/homurachan/pytorch_cryoEM/blob/main/ctffind4_pytorch_no_cudnn.py) . This version removes the ctftilt feature, the need for scipy, and the requirement for cudnn. Usage is the same as the ctffind_ctftilt_pytorch.py.
+
 ## Update 20260915
 
 Upload [resmap_pytorch_py310_complete_2.0.0.zip](https://github.com/homurachan/pytorch_cryoEM/blob/main/resmap_pytorch_py310_complete_2.0.0.zip) . This one is the pytorch version of [resmap](https://resmap.sourceforge.net/) and [monores](https://www.sciencedirect.com/science/article/pii/S0969212617304434).
