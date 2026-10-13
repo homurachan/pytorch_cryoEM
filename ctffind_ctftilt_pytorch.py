@@ -5,6 +5,7 @@ CTFFIND 4.1.8, with an optional CTFTILT-style power-spectrum tilt fitter.
 Implemented
 -----------
 * MRC input (one 2-D micrograph per file; 3-D stacks are also accepted)
+* RELION corrected_micrographs.star input via --input_star (plain-text reader)
 * Batched PyTorch amplitude-spectrum generation and CTFFIND-like preprocessing
 * Batched 1-D mean-defocus grid search
 * Batched, derivative-free Powell direction-set refinement implemented in
@@ -26,13 +27,22 @@ Dependencies
 
 Example
 -------
-    python ctffind_torch_batched_powell_ctftilt_prior.py "MotionCorr/job003/*.mrc" \
+    python ctffind_ctftilt_pytorch.py "MotionCorr/job003/*.mrc" \
         --pixel-size 1.06 --voltage 300 --cs 2.7 \
         --amplitude-contrast 0.07 --box-size 512 \
         --min-resolution 30 --max-resolution 5 \
         --min-defocus 5000 --max-defocus 50000 \
         --defocus-step 500 --preprocess-batch-size 4 --fit-batch-size 64 \
         --output micrographs_ctf.star --ctf-dir CtfFind/job005
+
+    python ctffind_ctftilt_pytorch.py \
+        --input_star MotionCorr/job002/corrected_micrographs.star \
+        --output CtfFind/job005/micrographs_ctf.star --device cuda
+
+With --input_star, positional inputs are ignored. Explicit --pixel-size,
+--voltage, --cs and --amplitude-contrast override STAR optics values; missing
+values use the original defaults (or the MRC header for pixel size).
+Run from the RELION project directory for project-relative micrograph paths.
 """
 
 from __future__ import annotations
@@ -3756,6 +3766,236 @@ def _pixel_size_from_mrc(mrc: mrcfile.mrcfile.MrcFile) -> Optional[float]:
     return value
 
 
+def _iter_star_tokens(path: Path) -> Iterator[tuple[str, int, bool]]:
+    """Yield (text, line number, quoted) without shell/backslash processing."""
+    with path.open("r", encoding="utf-8-sig") as handle:
+        lines = iter(enumerate(handle, 1))
+        for line_number, line in lines:
+            if line.startswith(";"):
+                parts = [line[1:].rstrip("\r\n")]
+                for _, continuation in lines:
+                    if continuation.startswith(";"):
+                        if continuation[1:].strip() and not continuation[1:].lstrip().startswith("#"):
+                            raise ValueError(f"{path}:{line_number}: invalid multiline STAR value")
+                        break
+                    parts.append(continuation.rstrip("\r\n"))
+                else:
+                    raise ValueError(f"{path}:{line_number}: unterminated multiline STAR value")
+                yield "\n".join(parts), line_number, True
+                continue
+            pos = 0
+            while pos < len(line):
+                if line[pos].isspace():
+                    pos += 1
+                    continue
+                if line[pos] == "#":
+                    break
+                if line[pos] in ("'", '"'):
+                    quote = line[pos]
+                    start = pos = pos + 1
+                    while pos < len(line):
+                        if line[pos] == quote and (
+                            pos + 1 == len(line) or line[pos + 1].isspace()
+                            or line[pos + 1] == "#"
+                        ):
+                            break
+                        pos += 1
+                    else:
+                        raise ValueError(f"{path}:{line_number}: unterminated quoted STAR value")
+                    yield line[start:pos], line_number, True
+                    pos += 1
+                else:
+                    start = pos
+                    while pos < len(line) and not line[pos].isspace():
+                        pos += 1
+                    yield line[start:pos], line_number, False
+
+
+def _star_control(token: tuple[str, int, bool]) -> bool:
+    value, _, quoted = token
+    value = value.lower()
+    return not quoted and (
+        value.startswith(("_", "data_", "save_"))
+        or value in {"loop_", "stop_", "global_"}
+    )
+
+
+def _iter_star_rows(path: Path) -> Iterator[tuple[str, dict[str, str], int]]:
+    """Read STAR loops by column name; a row may span physical text lines."""
+    tokens = iter(_iter_star_tokens(path))
+    token = next(tokens, None)
+    block = ""
+    while token is not None:
+        value, line_number, quoted = token
+        lower = value.lower()
+        if not quoted and lower.startswith("data_"):
+            block = lower[5:]
+            token = next(tokens, None)
+        elif not quoted and lower == "loop_":
+            columns: list[str] = []
+            token = next(tokens, None)
+            while token is not None and not token[2] and token[0].startswith("_"):
+                columns.append(token[0].lower())
+                token = next(tokens, None)
+            if not columns or len(set(columns)) != len(columns):
+                raise ValueError(f"{path}:{line_number}: missing or duplicate STAR loop columns")
+            row: list[str] = []
+            row_line = line_number
+            while token is not None and not _star_control(token):
+                if not row:
+                    row_line = token[1]
+                row.append(token[0])
+                if len(row) == len(columns):
+                    yield block, dict(zip(columns, row)), row_line
+                    row = []
+                token = next(tokens, None)
+            if row:
+                raise ValueError(
+                    f"{path}:{row_line}: incomplete STAR row in data_{block}: "
+                    f"expected {len(columns)} values, found {len(row)}"
+                )
+        elif not quoted and lower.startswith("_"):
+            scalar = next(tokens, None)
+            if scalar is None or _star_control(scalar):
+                raise ValueError(f"{path}:{line_number}: missing value for {value}")
+            token = next(tokens, None)
+        elif not quoted and lower == "stop_":
+            token = next(tokens, None)
+        else:
+            raise ValueError(f"{path}:{line_number}: unexpected STAR token {value!r}")
+
+
+@dataclass(frozen=True)
+class _StarMicrographInput:
+    config: CtffindConfig
+    original_pixel_size_A: Optional[float] = None
+
+
+def _resolve_star_micrograph(name: str, star_path: Path, line_number: int) -> str:
+    if name in {"", ".", "?"}:
+        raise ValueError(f"{star_path}:{line_number}: missing _rlnMicrographName")
+    if "@" in name and name.split("@", 1)[0].isdigit():
+        raise ValueError(
+            f"{star_path}:{line_number}: indexed stack names are not supported in "
+            "--input_star; supply a micrograph MRC filename"
+        )
+    path = Path(name)
+    if path.is_absolute():
+        candidates = [path]
+    else:
+        # RELION paths are normally relative to the project working directory.
+        # Also accept STAR-relative files and project paths from nested job dirs.
+        candidates = [Path.cwd() / path]
+        candidates.extend(parent / path for parent in star_path.parents)
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate.resolve())
+    raise FileNotFoundError(
+        f"{star_path}:{line_number}: micrograph not found: {name!r}. "
+        "Run from the RELION project directory or use absolute paths in the STAR."
+    )
+
+
+def _read_micrograph_star(
+    filename: str,
+    config: CtffindConfig,
+    overrides: Optional[dict[str, float]] = None,
+) -> dict[str, _StarMicrographInput]:
+    """Read RELION micrograph paths and optics using only Python text I/O.
+
+    Explicit overrides take priority over STAR values, then config defaults.
+    Motion statistics and per-micrograph metadata filenames are not CTF inputs.
+    """
+    path = Path(filename).resolve()
+    optics: dict[int, dict[str, str]] = {}
+    micrographs: list[tuple[dict[str, str], int]] = []
+
+    def group_id(value: str, line_number: int) -> int:
+        try:
+            group = int(value)
+            if group > 0:
+                return group
+        except ValueError:
+            pass
+        raise ValueError(f"{path}:{line_number}: invalid _rlnOpticsGroup {value!r}")
+
+    for block, row, line_number in _iter_star_rows(path):
+        if block == "optics":
+            if "_rlnopticsgroup" not in row:
+                raise ValueError(f"{path}:{line_number}: data_optics lacks _rlnOpticsGroup")
+            group = group_id(row["_rlnopticsgroup"], line_number)
+            if group in optics:
+                raise ValueError(f"{path}:{line_number}: duplicate optics group {group}")
+            optics[group] = row
+        elif "_rlnmicrographname" in row:
+            micrographs.append((row, line_number))
+    if not micrographs:
+        raise ValueError(f"{path}: no micrograph rows with _rlnMicrographName found")
+
+    fields = {
+        "pixel_size_A": "_rlnmicrographpixelsize",
+        "acceleration_voltage_kV": "_rlnvoltage",
+        "spherical_aberration_mm": "_rlnsphericalaberration",
+        "amplitude_contrast": "_rlnamplitudecontrast",
+    }
+    overrides = overrides or {}
+    unknown = set(overrides) - fields.keys()
+    if unknown:
+        raise ValueError(f"Unknown STAR microscope overrides: {sorted(unknown)}")
+
+    def number(value: str | float, field: str, line_number: int) -> float:
+        try:
+            result = float(value)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"{path}:{line_number}: invalid {field}: {value!r}") from exc
+        if not math.isfinite(result):
+            raise ValueError(f"{path}:{line_number}: non-finite {field}: {value!r}")
+        if field in {"pixel_size_A", "original_pixel_size_A", "acceleration_voltage_kV"} and result <= 0:
+            raise ValueError(f"{path}:{line_number}: {field} must be positive")
+        if field == "spherical_aberration_mm" and result < 0:
+            raise ValueError(f"{path}:{line_number}: Cs must be non-negative")
+        if field == "amplitude_contrast" and not 0 <= result < 1:
+            raise ValueError(f"{path}:{line_number}: amplitude contrast must satisfy 0 <= A < 1")
+        return result
+
+    inputs: dict[str, _StarMicrographInput] = {}
+    for row, line_number in micrographs:
+        if optics:
+            if "_rlnopticsgroup" not in row:
+                raise ValueError(f"{path}:{line_number}: micrograph lacks _rlnOpticsGroup")
+            group = group_id(row["_rlnopticsgroup"], line_number)
+            if group not in optics:
+                raise ValueError(f"{path}:{line_number}: unknown optics group {group}")
+            values = dict(optics[group])
+        else:
+            if "_rlnopticsgroup" in row:
+                raise ValueError(f"{path}:{line_number}: _rlnOpticsGroup refers to missing data_optics")
+            values = {}
+        # Support older one-table micrograph STAR files as well.
+        values.update({key: value for key, value in row.items() if value not in {"?", "."}})
+        params = {}
+        for field, column in fields.items():
+            raw = overrides.get(field, values.get(column))
+            if raw is None or raw in {"?", "."}:
+                raw = getattr(config, field)
+            if raw is not None:
+                params[field] = number(raw, field, line_number)
+        # Original (movie) pixel size is not a fallback for corrected pixel size:
+        # motion correction may have binned the image. Use the MRC header instead.
+        original = values.get("_rlnmicrographoriginalpixelsize")
+        original_pixel = (
+            number(original, "original_pixel_size_A", line_number)
+            if original not in {None, "?", "."} else None
+        )
+        effective_config = replace(config, **params)
+        effective_config.validate()
+        source = _resolve_star_micrograph(row["_rlnmicrographname"], path, line_number)
+        if source in inputs:
+            raise ValueError(f"{path}:{line_number}: duplicate micrograph: {source}")
+        inputs[source] = _StarMicrographInput(effective_config, original_pixel)
+    return inputs
+
+
 def _expand_input_paths(inputs: Sequence[str]) -> list[str]:
     expanded: list[str] = []
     for item in inputs:
@@ -3819,6 +4059,7 @@ class _MicrographRecord:
     micrograph_name: str
     ctf_path: Path
     ctf_image_name: str
+    config: Optional[CtffindConfig] = None
 
 
 def _relion_path(path: str | Path) -> str:
@@ -3863,13 +4104,15 @@ def _iter_micrograph_records(
     paths: Sequence[str],
     config: CtffindConfig,
     ctf_dir: Path,
+    star_inputs: Optional[dict[str, _StarMicrographInput]] = None,
 ) -> Iterator[_MicrographRecord]:
     used_ctf_paths: dict[Path, str] = {}
     for path in paths:
+        input_config = star_inputs[path].config if star_inputs else config
         with mrcfile.mmap(path, mode="r", permissive=True) as mrc:
             data = mrc.data
             header_pixel = _pixel_size_from_mrc(mrc)
-            pixel_size = config.pixel_size_A or header_pixel
+            pixel_size = input_config.pixel_size_A or header_pixel
             if pixel_size is None:
                 raise ValueError(
                     f"{path}: pixel size not supplied and absent from MRC header"
@@ -3909,6 +4152,7 @@ def _iter_micrograph_records(
                     micrograph_name=micrograph_name,
                     ctf_path=ctf_path,
                     ctf_image_name=ctf_rel,
+                    config=input_config,
                 )
 
 
@@ -3919,7 +4163,7 @@ def _iter_compatible_batches(
     batch: list[_MicrographRecord] = []
     key = None
     for record in records:
-        record_key = (record.array.shape, round(record.pixel_size_A, 8))
+        record_key = (record.array.shape, round(record.pixel_size_A, 8), record.config)
         if batch and (record_key != key or len(batch) >= batch_size):
             yield batch
             batch = []
@@ -3947,23 +4191,32 @@ def _write_relion_star(
     config: CtffindConfig,
     *,
     include_ctf_image: bool,
+    star_inputs: Optional[dict[str, _StarMicrographInput]] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    optics_keys: dict[tuple[float, float, float, float], int] = {}
-    optics_rows: list[tuple[int, float]] = []
+    optics_keys: dict[tuple[float, float, float, float, float], int] = {}
+    optics_rows: list[tuple[int, float, float, CtffindConfig]] = []
     row_groups: list[int] = []
     for result in results:
+        star_input = star_inputs.get(result.source_file) if star_inputs else None
+        input_config = star_input.config if star_input else config
+        original_pixel = (
+            star_input.original_pixel_size_A
+            if star_input and star_input.original_pixel_size_A is not None
+            else result.pixel_size_input_A
+        )
         key = (
             round(result.pixel_size_input_A, 8),
-            round(config.acceleration_voltage_kV, 8),
-            round(config.spherical_aberration_mm, 8),
-            round(config.amplitude_contrast, 8),
+            round(input_config.acceleration_voltage_kV, 8),
+            round(input_config.spherical_aberration_mm, 8),
+            round(input_config.amplitude_contrast, 8),
+            round(original_pixel, 8),
         )
         group = optics_keys.get(key)
         if group is None:
             group = len(optics_rows) + 1
             optics_keys[key] = group
-            optics_rows.append((group, result.pixel_size_input_A))
+            optics_rows.append((group, result.pixel_size_input_A, original_pixel, input_config))
         row_groups.append(group)
 
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -3981,12 +4234,12 @@ def _write_relion_star(
         ]
         for idx, column in enumerate(optics_columns, 1):
             handle.write(f"{column} #{idx} \n")
-        for group, pixel in optics_rows:
+        for group, pixel, original_pixel, input_config in optics_rows:
             handle.write(
-                f"opticsGroup{group} {group:d} {pixel:.6f} "
-                f"{config.acceleration_voltage_kV:.6f} "
-                f"{config.spherical_aberration_mm:.6f} "
-                f"{config.amplitude_contrast:.6f} {pixel:.6f}\n"
+                f"opticsGroup{group} {group:d} {original_pixel:.6f} "
+                f"{input_config.acceleration_voltage_kV:.6f} "
+                f"{input_config.spherical_aberration_mm:.6f} "
+                f"{input_config.amplitude_contrast:.6f} {pixel:.6f}\n"
             )
 
         handle.write("\n\n# version 30001\n\n")
@@ -4107,13 +4360,27 @@ def fit_mrc_files(
     write_tilt_png: bool = True,
     tilt_results_tsv: Optional[str] = None,
     tilt_angle_file: Optional[str] = None,
+    input_star: Optional[str] = None,
+    input_star_overrides: Optional[dict[str, float]] = None,
 ) -> list[CtfFitResult]:
-    """Run a two-stage raw-image/preprocessed-spectrum GPU pipeline."""
-    paths = _expand_input_paths(input_paths)
+    """Run a two-stage raw-image/preprocessed-spectrum GPU pipeline.
+
+    input_star ignores input_paths and supplies per-micrograph optics parameters.
+    input_star_overrides uses CtffindConfig microscope field names and takes
+    priority over STAR values; config supplies defaults for missing STAR fields.
+    """
+    star_inputs = (
+        _read_micrograph_star(input_star, config, input_star_overrides)
+        if input_star is not None else None
+    )
+    paths = list(star_inputs) if star_inputs is not None else _expand_input_paths(input_paths)
+    if input_star is not None:
+        print(f"Input STAR: {input_star}; positional MRC inputs are ignored")
     tilt_angle_mapping = (
         _read_tilt_angle_file(tilt_angle_file) if tilt_angle_file else {}
     )
-    estimator = TorchCtffindPowell(config)
+    active_config = star_inputs[paths[0]].config if star_inputs else config
+    estimator = TorchCtffindPowell(active_config)
     output_path = Path(output_star).resolve()
     ctf_dir = (
         Path(ctf_output_dir).resolve()
@@ -4266,6 +4533,7 @@ def fit_mrc_files(
             results,
             config,
             include_ctf_image=write_diagnostic_maps,
+            star_inputs=star_inputs,
         )
         if config.fit_tilt:
             _write_tilt_tsv(tilt_tsv_path, results)
@@ -4345,8 +4613,14 @@ def fit_mrc_files(
         while pending_count >= config.fit_batch_size:
             fit_pending(config.fit_batch_size)
 
-    records = _iter_micrograph_records(paths, config, ctf_dir)
+    records = _iter_micrograph_records(paths, config, ctf_dir, star_inputs)
     for raw_batch in _iter_compatible_batches(records, config.preprocess_batch_size):
+        batch_config = raw_batch[0].config or config
+        if batch_config != active_config:
+            # Complete all spectra and tilt fits with the previous optics first.
+            flush_all_pending()
+            active_config = batch_config
+            estimator = TorchCtffindPowell(batch_config)
         first = preprocessed + 1
         last = preprocessed + len(raw_batch)
         shape = raw_batch[0].array.shape
@@ -4401,8 +4675,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument(
-        "inputs", nargs="+",
-        help="MRC/MRCS files, glob patterns, or directories containing MRC files",
+        "inputs", nargs="*",
+        help="MRC/MRCS files, glob patterns, or directories; ignored with --input_star",
+    )
+    parser.add_argument(
+        "--input_star", "--input-star", default=None, metavar="STAR",
+        help="RELION corrected_micrographs.star; replaces all positional MRC inputs",
     )
     parser.add_argument("--output", default="micrographs_ctf.star")
     parser.add_argument(
@@ -4411,11 +4689,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--pixel-size", type=float, default=None,
-        help="Input pixel size in Angstrom; otherwise read each MRC header",
+        help="Input pixel size in Angstrom; overrides STAR optics, then falls back to MRC header",
     )
-    parser.add_argument("--voltage", type=float, default=300.0)
-    parser.add_argument("--cs", type=float, default=2.7)
-    parser.add_argument("--amplitude-contrast", type=float, default=0.07)
+    parser.add_argument("--voltage", type=float, default=None,
+                        help="Voltage in kV; overrides STAR optics; fallback: 300")
+    parser.add_argument("--cs", type=float, default=None,
+                        help="Spherical aberration in mm; overrides STAR optics; fallback: 2.7")
+    parser.add_argument("--amplitude-contrast", type=float, default=None,
+                        help="Amplitude contrast; overrides STAR optics; fallback: 0.07")
     parser.add_argument("--box-size", type=int, default=256)
     parser.add_argument("--min-resolution", type=float, default=30.0)
     parser.add_argument("--max-resolution", type=float, default=5.0)
@@ -4511,12 +4792,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = _build_arg_parser().parse_args(argv)
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+    if args.input_star is None and not args.inputs:
+        parser.error("provide MRC inputs or --input_star corrected_micrographs.star")
     config = CtffindConfig(
         pixel_size_A=args.pixel_size,
-        acceleration_voltage_kV=args.voltage,
-        spherical_aberration_mm=args.cs,
-        amplitude_contrast=args.amplitude_contrast,
+        acceleration_voltage_kV=args.voltage if args.voltage is not None else 300.0,
+        spherical_aberration_mm=args.cs if args.cs is not None else 2.7,
+        amplitude_contrast=args.amplitude_contrast if args.amplitude_contrast is not None else 0.07,
         box_size=args.box_size,
         minimum_resolution_A=args.min_resolution,
         maximum_resolution_A=args.max_resolution,
@@ -4587,6 +4871,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         write_tilt_png=not args.no_tilt_png,
         tilt_results_tsv=args.tilt_results_tsv,
         tilt_angle_file=args.tilt_angle_file,
+        input_star=args.input_star,
+        input_star_overrides={
+            field: value for field, value in {
+                "pixel_size_A": args.pixel_size,
+                "acceleration_voltage_kV": args.voltage,
+                "spherical_aberration_mm": args.cs,
+                "amplitude_contrast": args.amplitude_contrast,
+            }.items() if value is not None
+        },
     )
     return 0
 
