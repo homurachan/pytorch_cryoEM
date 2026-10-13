@@ -24,6 +24,15 @@ For unbend_pytorch_v2, nvidia-nvimgcodec-cu12[nvtiff], and nvidia-nvjpeg2k-cu12 
 
 6. The pytorch-implementation of cisTEM-simulate is here: https://github.com/homurachan/cisTEM_simulate_pytorch
 
+## Update 20261013
+
+Update the [ctffind_ctftilt_pytorch.py](https://github.com/homurachan/pytorch_cryoEM/blob/main/ctffind_ctftilt_pytorch.py) , so it can read the RELION corrected_micrographs.star
+from Motion Correction
+
+Usage: `python ctffind_ctftilt_pytorch.py --input_star corrected_micrographs.star --output micrographs_ctf.star --no-diagnostic-output --preprocess-batch-size 32 --fit-batch-size 64 --optimizer-check-interval 8`
+
+Remove `--no-diagnostic-output` if you want the .ctf output. Reduce `--preprocess-batch-size` and `--fit-batch-size` if it runs out of memory.
+
 ## Update 20260915
 
 Upload [resmap_pytorch_py310_complete_2.0.0.zip](https://github.com/homurachan/pytorch_cryoEM/blob/main/resmap_pytorch_py310_complete_2.0.0.zip) . This one is the pytorch version of [resmap](https://resmap.sourceforge.net/) and [monores](https://www.sciencedirect.com/science/article/pii/S0969212617304434).
