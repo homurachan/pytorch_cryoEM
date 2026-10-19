@@ -7,6 +7,8 @@ All settings are command-line options; run with --help for details.
 STAR support: data blocks, loops, # comments, quoted single-line values,
 arbitrary column order, and rows split across lines. Semicolon text fields
 and save frames are deliberately unsupported. This is not a general CIF parser.
+Use --star for particle tables with _rlnMicrographName, or --autopick-star
+for a single micrograph's coordinates (all rows belong to the supplied --mrc).
 TSV support: tab-separated header with x_pixel and y_pixel columns.
 Optional x_angstrom/y_angstrom columns can supply the pixel size.
 Coordinates and --radius refer to the input MRC BEFORE display binning.
@@ -97,8 +99,8 @@ def normalized_path(value):
     return posixpath.normpath(str(value).replace("\\", "/"))
 
 
-def read_coordinates(star, mrc_path, selector=None):
-    """Keep only potential matches, even if the STAR holds many micrographs."""
+def read_coordinates(star, mrc_path, selector=None, *, autopick=False):
+    """Read STAR coordinates; autopick assigns all coordinate rows to mrc_path."""
     queries = {normalized_path(selector)} if selector is not None else {
         normalized_path(mrc_path), normalized_path(Path(mrc_path).resolve())}
     basename = posixpath.basename(next(iter(queries)))
@@ -117,7 +119,14 @@ def read_coordinates(star, mrc_path, selector=None):
                 optics[group] = pixel
         if not required.issubset(row):
             continue
-        name = normalized_path(row["_rlnmicrographname"])
+        if autopick:
+            name = normalized_path(mrc_path)
+        elif "_rlnmicrographname" not in row:
+            raise ValueError(f"STAR line {line}: missing _rlnMicrographName; "
+                             "for a single-micrograph coordinate file, use "
+                             "--autopick-star instead of --star together with --mrc")
+        else:
+            name = normalized_path(row["_rlnmicrographname"])
 
         try:
             x, y = float(row["_rlncoordinatex"]), float(row["_rlncoordinatey"])
@@ -132,6 +141,9 @@ def read_coordinates(star, mrc_path, selector=None):
     exact = [name for name in candidates if name in queries]
     matches = exact or list(candidates)
     if not matches:
+        if autopick:
+            raise ValueError("Autopick STAR contains no particle coordinates; "
+                             "expected _rlnCoordinateX and _rlnCoordinateY columns")
         raise ValueError("No matching particles. Check --mrc / --micrograph and "
                          "_rlnMicrographName, _rlnCoordinateX, _rlnCoordinateY. "
                          "Preserve STAR newlines: # starts an end-of-line comment.")
@@ -323,10 +335,11 @@ def make_parser():
     parser = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     coordinate_input = parser.add_mutually_exclusive_group(required=True)
-    coordinate_input.add_argument("--star", type=Path, help="Particle STAR file")
+    coordinate_input.add_argument("--star", type=Path, help="Particle STAR file with _rlnMicrographName")
+    coordinate_input.add_argument("--autopick-star", type=Path, help="Single-micrograph STAR with _rlnCoordinateX/Y; reads all coordinate rows for --mrc without requiring _rlnMicrographName")
     coordinate_input.add_argument("--tsv", type=Path, help="2DTM TSV file with x_pixel/y_pixel; reads all rows regardless of MRC filename")
     parser.add_argument("--mrc", required=True, type=Path, help="Target unbinned 2D micrograph")
-    parser.add_argument("--micrograph", help="STAR micrograph name, if target was renamed; full path resolves duplicate basenames")
+    parser.add_argument("--micrograph", help="With --star only: micrograph name if target was renamed; full path resolves duplicate basenames")
     parser.add_argument("--bin", type=positive_int, default=1, help="Integer block-mean binning factor (default: 1)")
     parser.add_argument("--lowpass", type=finite_float, default=0, metavar="ANGSTROM", help="Low-pass resolution; <= 0 disables it (default: 0)")
     parser.add_argument("--angpix", type=positive_float, help="Input MRC A/pixel; default: STAR optics or TSV Angstrom/pixel ratio, then MRC header")
@@ -352,8 +365,9 @@ def run(args):
         coordinates, tsv_angpix = read_tsv_coordinates(coordinate_path)
         groups, optics, name = set(), {}, normalized_path(args.mrc)
     else:
-        coordinate_path = args.star
-        coordinates, groups, optics, name = read_coordinates(args.star, args.mrc, args.micrograph)
+        coordinate_path = args.autopick_star if args.autopick_star is not None else args.star
+        coordinates, groups, optics, name = read_coordinates(
+            coordinate_path, args.mrc, args.micrograph, autopick=args.autopick_star is not None)
     image, header_pixel = read_micrograph(args.mrc)
     height, width = image.shape
     if args.bin > min(height, width):
@@ -425,8 +439,8 @@ def main():
         parser.error("--sigma must be >= 0")
     if args.no_show and args.output is None:
         parser.error("--no-show requires --output")
-    if args.tsv is not None and args.micrograph is not None:
-        parser.error("--micrograph applies only to --star; TSV reads all particle rows")
+    if args.star is None and args.micrograph is not None:
+        parser.error("--micrograph applies only to --star; --autopick-star and --tsv read all coordinate rows")
     try:
         run(args)
     except (OSError, ValueError, RuntimeError, ImportError) as exc:
