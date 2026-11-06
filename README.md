@@ -24,6 +24,50 @@ For unbend_pytorch_v2, nvidia-nvimgcodec-cu12[nvtiff], and nvidia-nvjpeg2k-cu12 
 
 6. The pytorch-implementation of cisTEM-simulate is here: https://github.com/homurachan/cisTEM_simulate_pytorch
 
+7. The pytorch-implementation of [SIRM-RELION](https://github.com/homurachan/SIRM_RELION)
+
+   [relion_torch_v0.7.2rc6.zip](https://github.com/homurachan/pytorch_cryoEM/blob/main/relion_torch_v0.7.2rc6.zip)
+
+## Update 20261106
+
+Upload the relion_torch: [relion_torch_v0.7.2rc6.zip](https://github.com/homurachan/pytorch_cryoEM/blob/main/relion_torch_v0.7.2rc6.zip).
+
+Requirements: pytorch, numpy, mrcfile, starfile, pandas, scipy.
+
+This version has the following features:
+
+1. Autopicking using LoG filters
+2. 2D classification, with/skip alignment
+3. 3D classification, with/skip alignment
+4. 3D auto refine, does not require multiple GPUs
+5. 3D reconstruction using GPUs
+6. SIRM refinement and reconstruction
+7. CTF refine
+8. Joint orientation, translation, defocus refine. See the supplemental in [this paper](https://www.science.org/doi/10.1126/science.aan0327)
+
+This version does NOT have the following features:
+
+1. Running Motion Correction or CTFFIND (Replaced by [unbend_pytorch_v2.py](https://github.com/homurachan/pytorch_cryoEM/blob/main/unbend_pytorch_v2.py) and [ctffind4_pytorch_no_cudnn.py](https://github.com/homurachan/pytorch_cryoEM/blob/main/ctffind4_pytorch_no_cudnn.py))
+2. relion_display (Replaced by [v2lite](https://github.com/homurachan/pytorch_cryoEM/blob/main/v2lite.py) and [show_star_particles.py](https://github.com/homurachan/pytorch_cryoEM/blob/main/show_star_particles.py))
+3. Autopicking using 3D models (Replaced by [template matching](https://github.com/homurachan/cistem2dtm_pytorch))
+4. Particle Extraction (Replaced by [read_star_shift_crop_and_generate_new_star_v5.py](https://github.com/homurachan/Block-based-recontruction/blob/master/read_star_shift_crop_and_generate_new_star_v5_no_starfile.py))
+5. Subset Selection (will be replaced by standalone program)
+6. 3D Initial Model (No plan)
+7. 3D Multibody Refinement (No plan)
+8. Bayesian Polishing (in progress)
+9. Mask Creation (will be replaced by standalone program)
+10. Particle Subtraction (will be replaced by standalone program)
+11. Post-processing (will be replaced by standalone program)
+12. Local Resolution (Replaced by [resmap_pytorch_py310_complete_2.0.0.zip](https://github.com/homurachan/pytorch_cryoEM/blob/main/resmap_pytorch_py310_complete_2.0.0.zip))
+13. relion_star_handler (will be replaced by standalone program)
+14. relion_image_handler (will be replaced by standalone program)
+
+Usage: Basically the same as the original RELION. However, the continue run is done by --continue Class3D/job001/run_it025_state.pt
+
+Speed: Class3D: --healpix_order 2 is slow (7.5 deg with --oversampling 1), but --healpix_order 3 (3.75 deg with --oversampling 1) and above is much faster.
+
+A GUI will be uploaded soon.
+
 ## Update 20261013
 
 Update the [ctffind_ctftilt_pytorch.py](https://github.com/homurachan/pytorch_cryoEM/blob/main/ctffind_ctftilt_pytorch.py) , so it can read the RELION corrected_micrographs.star
