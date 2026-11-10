@@ -55,12 +55,12 @@ This version does NOT have the following features:
 6. 3D Initial Model (No plan)
 7. 3D Multibody Refinement (No plan)
 8. Bayesian Polishing (in progress)
-9. Mask Creation (will be replaced by standalone program)
+9. Mask Creation ([relion_mask_create.py](https://github.com/homurachan/pytorch_cryoEM/blob/main/relion_mask_create.py))
 10. Particle Subtraction (will be replaced by standalone program)
-11. Post-processing (will be replaced by standalone program)
+11. Post-processing ([relion_postprocess.py](https://github.com/homurachan/pytorch_cryoEM/blob/main/relion_postprocess.py))
 12. Local Resolution (Replaced by [resmap_pytorch_py310_complete_2.0.0.zip](https://github.com/homurachan/pytorch_cryoEM/blob/main/resmap_pytorch_py310_complete_2.0.0.zip))
-13. relion_star_handler (will be replaced by standalone program)
-14. relion_image_handler (will be replaced by standalone program)
+13. relion_star_handler ([relion_star_handler.py](https://github.com/homurachan/pytorch_cryoEM/blob/main/relion_star_handler.py))
+14. relion_image_handler ([relion_image_handler.py](https://github.com/homurachan/pytorch_cryoEM/blob/main/relion_image_handler.py))
 
 Usage: Basically the same as the original RELION. However, the continue run is done by --continue Class3D/job001/run_it025_state.pt
 
