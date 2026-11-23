@@ -28,6 +28,12 @@ For unbend_pytorch_v2, nvidia-nvimgcodec-cu12[nvtiff], and nvidia-nvjpeg2k-cu12 
 
    [relion_torch_v0.7.2rc6.zip](https://github.com/homurachan/pytorch_cryoEM/blob/main/relion_torch_v0.7.2rc6.zip)
 
+## Update 20261123
+
+Upload [relion_torch_v0.7.2rc13.zip](https://github.com/homurachan/pytorch_cryoEM/blob/main/relion_torch_v0.7.2rc13.zip)
+
+This version is 30%-40% faster than the rc6 version in my benchmarks.
+
 ## Update 20261106
 
 Upload the relion_torch: [relion_torch_v0.7.2rc6.zip](https://github.com/homurachan/pytorch_cryoEM/blob/main/relion_torch_v0.7.2rc6.zip).
