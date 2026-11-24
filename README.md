@@ -26,13 +26,13 @@ For unbend_pytorch_v2, nvidia-nvimgcodec-cu12[nvtiff], and nvidia-nvjpeg2k-cu12 
 
 7. The pytorch-implementation of [SIRM-RELION](https://github.com/homurachan/SIRM_RELION)
 
-   [relion_torch_v0.7.2rc6.zip](https://github.com/homurachan/pytorch_cryoEM/blob/main/relion_torch_v0.7.2rc6.zip)
+   [relion_torch_v0.7.2rc15.zip](https://github.com/homurachan/pytorch_cryoEM/blob/main/relion_torch_v0.7.2rc15.zip)
 
-## Update 20261123
+## Update 20261124
 
-Upload [relion_torch_v0.7.2rc13.zip](https://github.com/homurachan/pytorch_cryoEM/blob/main/relion_torch_v0.7.2rc13.zip)
+Upload [relion_torch_v0.7.2rc15.zip](https://github.com/homurachan/pytorch_cryoEM/blob/main/relion_torch_v0.7.2rc15.zip)
 
-This version is 30%-40% faster than the rc6 version in my benchmarks.
+This version is 30%-40% faster than the rc6 version in my benchmarks. 2x-5x faster when running --skip-align.
 
 ## Update 20261106
 
